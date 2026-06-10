@@ -12,6 +12,21 @@ import Interface from "./Interface";
 import { INITIAL_COLORS, INITIAL_VIEW_STATE, MAP_STYLE } from "../config";
 import useSmoothStateChange from "../hooks/useSmoothStateChange";
 
+function getNearestNodeLocal(latitude, longitude, graph) {
+    if (!graph || !graph.nodes) return null;
+    let nearestNode = null;
+    let minDistance = Infinity;
+
+    for (const node of graph.nodes.values()) {
+        const distance = Math.pow(node.latitude - latitude, 2) + Math.pow(node.longitude - longitude, 2);
+        if (distance < minDistance) {
+            minDistance = distance;
+            nearestNode = node;
+        }
+    }
+    return nearestNode;
+}
+
 function Map() {
     const [startNode, setStartNode] = useState(null);
     const [endNode, setEndNode] = useState(null);
@@ -29,6 +44,10 @@ function Map() {
     const [settings, setSettings] = useState({ algorithm: "astar", radius: 4, speed: 5 });
     const [colors, setColors] = useState(INITIAL_COLORS);
     const [viewState, setViewState] = useState(INITIAL_VIEW_STATE);
+    const [mapStyle, setMapStyle] = useState(() => {
+        const stored = localStorage.getItem("path_map_style");
+        return stored || MAP_STYLE;
+    });
     const ui = useRef();
     const fadeRadius = useRef();
     const requestRef = useRef();
@@ -48,39 +67,20 @@ function Map() {
         clearPath();
 
         // Place end node
-        if(info.rightButton || placeEnd) {
+        if(info.rightButton || placeEnd || (startNode && e.layer?.id === "selection-radius")) {
             if(e.layer?.id !== "selection-radius") {
                 ui.current.showSnack("Please select a point inside the radius.", "info");
                 return;
             }
 
-            if(loading) {
-                ui.current.showSnack("Please wait for all data to load.", "info");
-                return;
-            }
-
-            const loadingHandle = setTimeout(() => {
-                setLoading(true);
-            }, 300);
-            
-            const node = await getNearestNode(e.coordinate[1], e.coordinate[0]);
-            if(!node) {
-                ui.current.showSnack("No path was found in the vicinity, please try another location.");
-                clearTimeout(loadingHandle);
-                setLoading(false);
-                return;
-            }
-
-            const realEndNode = state.current.getNode(node.id);
-            setEndNode(node);
-            
-            clearTimeout(loadingHandle);
-            setLoading(false);
-
+            const realEndNode = getNearestNodeLocal(e.coordinate[1], e.coordinate[0], state.current.graph);
             if(!realEndNode) {
-                ui.current.showSnack("An error occurred. Please try again.");
+                ui.current.showSnack("No path node was found in the vicinity, please try another location.");
                 return;
             }
+
+            const node = { id: realEndNode.id, lat: realEndNode.latitude, lon: realEndNode.longitude };
+            setEndNode(node);
             state.current.endNode = realEndNode;
             
             return;
@@ -260,6 +260,11 @@ function Map() {
         }
     }
 
+    function changeMapStyle(newStyle) {
+        setMapStyle(newStyle);
+        localStorage.setItem("path_map_style", newStyle);
+    }
+
     useEffect(() => {
         if(!started) return;
         requestRef.current = requestAnimationFrame(animate);
@@ -339,7 +344,7 @@ function Map() {
                     />
                     <MapGL 
                         reuseMaps mapLib={maplibregl} 
-                        mapStyle={MAP_STYLE} 
+                        mapStyle={mapStyle} 
                         doubleClickZoom={false}
                     />
                 </DeckGL>
@@ -368,6 +373,8 @@ function Map() {
                 placeEnd={placeEnd}
                 setPlaceEnd={setPlaceEnd}
                 changeRadius={changeRadius}
+                mapStyle={mapStyle}
+                changeMapStyle={changeMapStyle}
             />
             <div className="attrib-container"><summary className="maplibregl-ctrl-attrib-button" title="Toggle attribution" aria-label="Toggle attribution"></summary><div className="maplibregl-ctrl-attrib-inner">© <a href="https://carto.com/about-carto/" target="_blank" rel="noopener">CARTO</a>, © <a href="http://www.openstreetmap.org/about/" target="_blank">OpenStreetMap</a> contributors</div></div>
         </>

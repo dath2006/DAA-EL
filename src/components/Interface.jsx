@@ -6,7 +6,7 @@ import { useState, useEffect, useRef, useImperativeHandle, forwardRef } from "re
 import { INITIAL_COLORS, LOCATIONS } from "../config";
 import { arrayToRgb, rgbToArray } from "../helpers";
 
-const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, time, maxTime, settings, colors, loading, timeChanged, cinematic, placeEnd, changeRadius, changeAlgorithm, setPlaceEnd, setCinematic, setSettings, setColors, startPathfinding, toggleAnimation, clearPath, changeLocation }, ref) => {
+const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, time, maxTime, settings, colors, loading, timeChanged, cinematic, placeEnd, changeRadius, changeAlgorithm, setPlaceEnd, setCinematic, setSettings, setColors, startPathfinding, toggleAnimation, clearPath, changeLocation, mapStyle, changeMapStyle }, ref) => {
     const [sidebar, setSidebar] = useState(false);
     const [snack, setSnack] = useState({
         open: false,
@@ -275,6 +275,24 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
                             <MenuItem value={"greedy"}>Greedy algorithm</MenuItem>
                             <MenuItem value={"dijkstra"}>Dijkstra&apos;s algorithm</MenuItem>
                             <MenuItem value={"bidirectional"}>Bidirectional Search algorithm</MenuItem>
+                        </Select>
+                    </FormControl>
+
+                    <FormControl variant="filled">
+                        <InputLabel style={{ fontSize: 14 }} id="map-style-select">Map Style</InputLabel>
+                        <Select
+                            labelId="map-style-select"
+                            value={mapStyle}
+                            onChange={e => {changeMapStyle(e.target.value);}}
+                            required
+                            style={{ backgroundColor: "#404156", color: "#fff", width: "100%", paddingLeft: 1 }}
+                            inputProps={{MenuProps: {MenuListProps: {sx: {backgroundColor: "#404156"}}}}}
+                            size="small"
+                        >
+                            <MenuItem value={"./map_style.json"}>Sleek Dark Mode</MenuItem>
+                            <MenuItem value={"https://basemaps.cartocdn.com/gl/positron-gl-style/style.json"}>Minimal Light Mode</MenuItem>
+                            <MenuItem value={"https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"}>Detailed Streets Mode</MenuItem>
+                            <MenuItem value={"https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"}>Dark Matter Mode</MenuItem>
                         </Select>
                     </FormControl>
 
