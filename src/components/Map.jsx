@@ -1,7 +1,7 @@
 import DeckGL from "@deck.gl/react";
 import { Map as MapGL } from "react-map-gl";
 import maplibregl from "maplibre-gl";
-import { PolygonLayer, ScatterplotLayer } from "@deck.gl/layers";
+import { PolygonLayer, ScatterplotLayer, TextLayer, PathLayer } from "@deck.gl/layers";
 import { FlyToInterpolator } from "deck.gl";
 import { TripsLayer } from "@deck.gl/geo-layers";
 import { createGeoJSONCircle } from "../helpers";
@@ -11,6 +11,7 @@ import PathfindingState from "../models/PathfindingState";
 import Interface from "./Interface";
 import { INITIAL_COLORS, INITIAL_VIEW_STATE, MAP_STYLE } from "../config";
 import useSmoothStateChange from "../hooks/useSmoothStateChange";
+import { solveClusteredTsp } from "../services/RoutingService";
 
 function getNearestNodeLocal(latitude, longitude, graph) {
     if (!graph || !graph.nodes) return null;
@@ -48,6 +49,14 @@ function Map() {
         const stored = localStorage.getItem("path_map_style");
         return stored || MAP_STYLE;
     });
+
+    // CTSP Routing states
+    const [routingMode, setRoutingMode] = useState("single");
+    const [deliveryStops, setDeliveryStops] = useState([]);
+    const [k, setK] = useState(3);
+    const [showNaiveRoute, setShowNaiveRoute] = useState(false);
+    const [optimizedRouteData, setOptimizedRouteData] = useState(null);
+
     const ui = useRef();
     const fadeRadius = useRef();
     const requestRef = useRef();
@@ -64,6 +73,83 @@ function Map() {
 
         setFadeRadiusReverse(false);
         fadeRadius.current = true;
+
+        if (routingMode === "clustered") {
+            if (!startNode) {
+                // First click sets Depot (equivalently starts graph loading)
+                const loadingHandle = setTimeout(() => {
+                    setLoading(true);
+                }, 300);
+
+                const node = await getNearestNode(e.coordinate[1], e.coordinate[0]);
+                if(!node) {
+                    ui.current.showSnack("No road node was found in the vicinity, please try another location.");
+                    clearTimeout(loadingHandle);
+                    setLoading(false);
+                    return;
+                }
+
+                setStartNode(node);
+                setDeliveryStops([]);
+                setOptimizedRouteData(null);
+                clearPath();
+
+                const circle = createGeoJSONCircle([node.lon, node.lat], radius ?? settings.radius);
+                setSelectionRadius([{ contour: circle}]);
+                
+                getMapGraph(getBoundingBoxFromPolygon(circle), node.id).then(graph => {
+                    state.current.graph = graph;
+                    clearPath();
+                    clearTimeout(loadingHandle);
+                    setLoading(false);
+                }).catch(err => {
+                    clearTimeout(loadingHandle);
+                    setLoading(false);
+                    ui.current.showSnack("Error loading graph: " + err.message);
+                });
+            } else {
+                // Subsequent clicks inside radius add stops
+                if (e.layer?.id !== "selection-radius" && e.layer?.id !== "depot-point" && e.layer?.id !== "delivery-stops" && e.layer?.id !== "stop-labels") {
+                    ui.current.showSnack("Please click inside the selection radius to add delivery stops.", "info");
+                    return;
+                }
+
+                const realNode = getNearestNodeLocal(e.coordinate[1], e.coordinate[0], state.current.graph);
+                if (!realNode) {
+                    ui.current.showSnack("No road node found in the vicinity. Try clicking closer to a road.");
+                    return;
+                }
+
+                if (deliveryStops.some(s => s.id === realNode.id)) {
+                    ui.current.showSnack("This stop has already been added.", "info");
+                    return;
+                }
+
+                clearPath();
+                setOptimizedRouteData(null);
+
+                const newStop = {
+                    id: realNode.id,
+                    lat: realNode.latitude,
+                    lon: realNode.longitude,
+                    address: `Stop #${deliveryStops.length + 1} (${realNode.latitude.toFixed(4)}, ${realNode.longitude.toFixed(4)})`
+                };
+
+                setDeliveryStops(prev => [...prev, newStop]);
+
+                fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${realNode.latitude}&lon=${realNode.longitude}`, {
+                    headers: { "User-Agent": "Map-Pathfinding-Visualizer-CTSP" }
+                })
+                .then(r => r.json())
+                .then(data => {
+                    const name = data.display_name ? data.display_name.split(",").slice(0, 3).join(",") : newStop.address;
+                    setDeliveryStops(prev => prev.map(s => s.id === realNode.id ? { ...s, address: name } : s));
+                })
+                .catch(() => {});
+            }
+            return;
+        }
+
         clearPath();
 
         // Place end node
@@ -118,9 +204,58 @@ function Map() {
         setFadeRadiusReverse(true);
         setTimeout(() => {
             clearPath();
-            state.current.start(settings.algorithm);
-            setStarted(true);
+            if (routingMode === "clustered") {
+                startClusteredAnimation();
+            } else {
+                state.current.start(settings.algorithm);
+                setStarted(true);
+            }
         }, 400);
+    }
+
+    function startClusteredAnimation() {
+        if (!startNode || deliveryStops.length === 0) return;
+
+        const data = solveClusteredTsp(
+            { id: startNode.id, lat: startNode.lat, lon: startNode.lon },
+            deliveryStops,
+            k,
+            state.current.graph
+        );
+
+        if (!data) {
+            ui.current.showSnack("Failed to solve Clustered TSP routing.");
+            return;
+        }
+
+        setOptimizedRouteData(data);
+
+        let currentTimer = 0;
+        const pathWaypoints = [];
+
+        for (const segment of data.optimizedRoute) {
+            const segmentType = segment.type; // "connector" or "zone-0", "zone-1", etc.
+
+            for (let i = 0; i < segment.path.length - 1; i++) {
+                const node = segment.path[i];
+                const nextNode = segment.path[i + 1];
+                const distance = Math.hypot(nextNode.longitude - node.longitude, nextNode.latitude - node.latitude);
+                const timeAdd = distance * 50000;
+
+                pathWaypoints.push({
+                    path: [[node.longitude ?? node.lon, node.latitude ?? node.lat], [nextNode.longitude ?? nextNode.lon, nextNode.latitude ?? nextNode.lat]],
+                    timestamps: [currentTimer, currentTimer + timeAdd],
+                    color: segmentType
+                });
+
+                currentTimer += timeAdd;
+            }
+        }
+
+        waypoints.current = pathWaypoints;
+        timer.current = currentTimer;
+        setTripsData(pathWaypoints);
+        setStarted(true);
     }
 
     // Start or pause already running animation
@@ -156,6 +291,30 @@ function Map() {
 
     // Progress animation by one step
     function animateStep(newTime) {
+        if (routingMode === "clustered") {
+            if (previousTimeRef.current != null && !animationEnded) {
+                const deltaTime = newTime - previousTimeRef.current;
+                const timeStep = deltaTime * 0.05 * playbackDirection;
+                setTime(prevTime => {
+                    const nextTime = prevTime + timeStep;
+                    if (nextTime >= timer.current && playbackDirection !== -1) {
+                        setAnimationEnded(true);
+                        setStarted(false);
+                        return timer.current;
+                    }
+                    return Math.max(0, nextTime);
+                });
+            }
+            if (previousTimeRef.current != null && animationEnded && playbackOn) {
+                const deltaTime = newTime - previousTimeRef.current;
+                if (time >= timer.current && playbackDirection !== -1) {
+                    setPlaybackOn(false);
+                }
+                setTime(prevTime => (Math.max(Math.min(prevTime + deltaTime * 0.1 * playbackDirection, timer.current), 0)));
+            }
+            return;
+        }
+
         const updatedNodes = state.current.nextStep();
         for(const updatedNode of updatedNodes) {
             updateWaypoints(updatedNode, updatedNode.referer);
@@ -256,6 +415,10 @@ function Map() {
     function changeRadius(radius) {
         changeSettings({...settings, radius});
         if(startNode) {
+            setStartNode(null);
+            setDeliveryStops([]);
+            setOptimizedRouteData(null);
+            clearPath();
             mapClick({coordinate: [startNode.lon, startNode.lat]}, {}, radius);
         }
     }
@@ -263,6 +426,15 @@ function Map() {
     function changeMapStyle(newStyle) {
         setMapStyle(newStyle);
         localStorage.setItem("path_map_style", newStyle);
+    }
+
+    function changeLocation(location) {
+        setStartNode(null);
+        setEndNode(null);
+        setDeliveryStops([]);
+        setOptimizedRouteData(null);
+        clearPath();
+        setViewState({ ...viewState, longitude: location.longitude, latitude: location.latitude, zoom: 13,transitionDuration: 1, transitionInterpolator: new FlyToInterpolator()});
     }
 
     useEffect(() => {
@@ -303,45 +475,160 @@ function Map() {
                         getLineWidth={3}
                         opacity={selectionRadiusOpacity}
                     />
+                    {routingMode === "clustered" && showNaiveRoute && optimizedRouteData && (
+                        <PathLayer
+                            id="naive-route"
+                            data={[
+                                {
+                                    path: optimizedRouteData.naiveRoute.flatMap(seg => 
+                                        seg.path.map(node => [node.longitude ?? node.lon, node.latitude ?? node.lat])
+                                    ),
+                                    color: [120, 120, 120, 150]
+                                }
+                            ]}
+                            getPath={d => d.path}
+                            getColor={d => d.color}
+                            getWidth={3}
+                            widthMinPixels={2}
+                        />
+                    )}
                     <TripsLayer
                         id={"pathfinding-layer"}
                         data={tripsData}
                         opacity={1}
-                        widthMinPixels={3}
-                        widthMaxPixels={5}
+                        widthMinPixels={4}
+                        widthMaxPixels={6}
                         fadeTrail={false}
                         currentTime={time}
-                        getColor={d => colors[d.color]}
-                        /** Create a nice glowy effect that absolutely kills the performance  */
-                        // getColor={(d) => {
-                        //     if(d.color !== "path") return colors[d.color];
-                        //     const color = colors[d.color];
-                        //     const delta = Math.abs(time - d.timestamp);
-                        //     return color.map(c => Math.max((c * 1.6) - delta * 0.1, c));
-                        // }}
+                        getColor={d => {
+                            const ZONE_COLORS = {
+                                "zone-0": [0, 150, 136],
+                                "zone-1": [255, 111, 0],
+                                "zone-2": [255, 193, 7],
+                                "zone-3": [156, 39, 176],
+                                "zone-4": [233, 30, 99],
+                                "zone-5": [76, 175, 80],
+                                "zone-6": [33, 150, 243],
+                                "zone-7": [255, 87, 34]
+                            };
+                            const CONNECTOR_COLOR = [224, 224, 224];
+                            if (d.color === "connector") return CONNECTOR_COLOR;
+                            if (d.color && d.color.startsWith("zone-")) return ZONE_COLORS[d.color] || [255, 255, 255];
+                            return colors[d.color] || colors.path;
+                        }}
                         updateTriggers={{
                             getColor: [colors.path, colors.route]
                         }}
                     />
-                    <ScatterplotLayer 
-                        id="start-end-points"
-                        data={[
-                            ...(startNode ? [{ coordinates: [startNode.lon, startNode.lat], color: colors.startNodeFill, lineColor: colors.startNodeBorder }] : []),
-                            ...(endNode ? [{ coordinates: [endNode.lon, endNode.lat], color: colors.endNodeFill, lineColor: colors.endNodeBorder }] : []),
-                        ]}
-                        pickable={true}
-                        opacity={1}
-                        stroked={true}
-                        filled={true}
-                        radiusScale={1}
-                        radiusMinPixels={7}
-                        radiusMaxPixels={20}
-                        lineWidthMinPixels={1}
-                        lineWidthMaxPixels={3}
-                        getPosition={d => d.coordinates}
-                        getFillColor={d => d.color}
-                        getLineColor={d => d.lineColor}
-                    />
+                    {routingMode === "clustered" ? (
+                        <>
+                            {/* Depot Point */}
+                            {startNode && (
+                                <ScatterplotLayer 
+                                    id="depot-point"
+                                    data={[{ coordinates: [startNode.lon, startNode.lat], color: colors.startNodeFill, lineColor: colors.startNodeBorder }]}
+                                    pickable={true}
+                                    opacity={1}
+                                    stroked={true}
+                                    filled={true}
+                                    radiusScale={1}
+                                    radiusMinPixels={9}
+                                    radiusMaxPixels={22}
+                                    lineWidthMinPixels={2}
+                                    lineWidthMaxPixels={4}
+                                    getPosition={d => d.coordinates}
+                                    getFillColor={d => d.color}
+                                    getLineColor={d => d.lineColor}
+                                />
+                            )}
+                            {/* Delivery Stops */}
+                            <ScatterplotLayer 
+                                id="delivery-stops"
+                                data={deliveryStops.map((stop, idx) => {
+                                    const ZONE_COLORS = {
+                                        "zone-0": [0, 150, 136],
+                                        "zone-1": [255, 111, 0],
+                                        "zone-2": [255, 193, 7],
+                                        "zone-3": [156, 39, 176],
+                                        "zone-4": [233, 30, 99],
+                                        "zone-5": [76, 175, 80],
+                                        "zone-6": [33, 150, 243],
+                                        "zone-7": [255, 87, 34]
+                                    };
+                                    let color = [64, 196, 255];
+                                    if (optimizedRouteData && stop.clusterId !== undefined) {
+                                        color = ZONE_COLORS[`zone-${stop.clusterId}`] || color;
+                                    }
+                                    return {
+                                        coordinates: [stop.lon, stop.lat],
+                                        color: color,
+                                        lineColor: [255, 255, 255]
+                                    };
+                                })}
+                                pickable={true}
+                                opacity={1}
+                                stroked={true}
+                                filled={true}
+                                radiusScale={1}
+                                radiusMinPixels={7}
+                                radiusMaxPixels={18}
+                                lineWidthMinPixels={1.5}
+                                lineWidthMaxPixels={3.5}
+                                getPosition={d => d.coordinates}
+                                getFillColor={d => d.color}
+                                getLineColor={d => d.lineColor}
+                            />
+                            {/* Text Labels */}
+                            <TextLayer
+                                id="stop-labels"
+                                data={[
+                                    ...(startNode ? [{ coordinates: [startNode.lon, startNode.lat], text: "DEPOT", color: [255, 255, 255] }] : []),
+                                    ...deliveryStops.map((stop, idx) => {
+                                        let label = `D${idx + 1}`;
+                                        if (optimizedRouteData && stop.clusterId !== undefined) {
+                                            const zoneLetters = ["A", "B", "C", "D", "E", "F", "G", "H"];
+                                            const letter = zoneLetters[stop.clusterId] || `${stop.clusterId}`;
+                                            const cluster = optimizedRouteData.clusters.find(c => c.id === stop.clusterId);
+                                            const stopSubIdx = cluster ? cluster.stops.findIndex(s => s.id === stop.id) + 1 : idx + 1;
+                                            label = `D${idx + 1} (${letter}${stopSubIdx})`;
+                                        }
+                                        return {
+                                            coordinates: [stop.lon, stop.lat],
+                                            text: label,
+                                            color: [255, 255, 255]
+                                        };
+                                    })
+                                ]}
+                                getPosition={d => d.coordinates}
+                                getText={d => d.text}
+                                getSize={12}
+                                getColor={d => d.color}
+                                getTextAnchor="middle"
+                                getAlignmentBaseline="bottom"
+                                pixelOffset={[0, -12]}
+                            />
+                        </>
+                    ) : (
+                        <ScatterplotLayer 
+                            id="start-end-points"
+                            data={[
+                                ...(startNode ? [{ coordinates: [startNode.lon, startNode.lat], color: colors.startNodeFill, lineColor: colors.startNodeBorder }] : []),
+                                ...(endNode ? [{ coordinates: [endNode.lon, endNode.lat], color: colors.endNodeFill, lineColor: colors.endNodeBorder }] : []),
+                            ]}
+                            pickable={true}
+                            opacity={1}
+                            stroked={true}
+                            filled={true}
+                            radiusScale={1}
+                            radiusMinPixels={7}
+                            radiusMaxPixels={20}
+                            lineWidthMinPixels={1}
+                            lineWidthMaxPixels={3}
+                            getPosition={d => d.coordinates}
+                            getFillColor={d => d.color}
+                            getLineColor={d => d.lineColor}
+                        />
+                    )}
                     <MapGL 
                         reuseMaps mapLib={maplibregl} 
                         mapStyle={mapStyle} 
@@ -351,7 +638,7 @@ function Map() {
             </div>
             <Interface 
                 ref={ui}
-                canStart={startNode && endNode}
+                canStart={routingMode === "clustered" ? (startNode && deliveryStops.length > 0) : (startNode && endNode)}
                 started={started}
                 animationEnded={animationEnded}
                 playbackOn={playbackOn}
@@ -375,6 +662,23 @@ function Map() {
                 changeRadius={changeRadius}
                 mapStyle={mapStyle}
                 changeMapStyle={changeMapStyle}
+
+                routingMode={routingMode}
+                setRoutingMode={setRoutingMode}
+                deliveryStops={deliveryStops}
+                setDeliveryStops={setDeliveryStops}
+                k={k}
+                setK={setK}
+                showNaiveRoute={showNaiveRoute}
+                setShowNaiveRoute={setShowNaiveRoute}
+                optimizedRouteData={optimizedRouteData}
+                setOptimizedRouteData={setOptimizedRouteData}
+                solveClusteredTsp={(depot, stops, zones, graph) => {
+                    const data = solveClusteredTsp(depot, stops, zones, graph);
+                    setOptimizedRouteData(data);
+                    return data;
+                }}
+                graph={state.current.graph}
             />
             <div className="attrib-container"><summary className="maplibregl-ctrl-attrib-button" title="Toggle attribution" aria-label="Toggle attribution"></summary><div className="maplibregl-ctrl-attrib-inner">© <a href="https://carto.com/about-carto/" target="_blank" rel="noopener">CARTO</a>, © <a href="http://www.openstreetmap.org/about/" target="_blank">OpenStreetMap</a> contributors</div></div>
         </>

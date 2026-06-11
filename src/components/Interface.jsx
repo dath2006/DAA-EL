@@ -5,8 +5,9 @@ import Slider from "./Slider";
 import { useState, useEffect, useRef, useImperativeHandle, forwardRef } from "react";
 import { INITIAL_COLORS, LOCATIONS } from "../config";
 import { arrayToRgb, rgbToArray } from "../helpers";
+import { getElbowData } from "../services/RoutingService";
 
-const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, time, maxTime, settings, colors, loading, timeChanged, cinematic, placeEnd, changeRadius, changeAlgorithm, setPlaceEnd, setCinematic, setSettings, setColors, startPathfinding, toggleAnimation, clearPath, changeLocation, mapStyle, changeMapStyle }, ref) => {
+const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, time, maxTime, settings, colors, loading, timeChanged, cinematic, placeEnd, changeRadius, changeAlgorithm, setPlaceEnd, setCinematic, setSettings, setColors, startPathfinding, toggleAnimation, clearPath, changeLocation, mapStyle, changeMapStyle, routingMode, setRoutingMode, deliveryStops, setDeliveryStops, k, setK, showNaiveRoute, setShowNaiveRoute, optimizedRouteData, setOptimizedRouteData, solveClusteredTsp, graph }, ref) => {
     const [sidebar, setSidebar] = useState(false);
     const [snack, setSnack] = useState({
         open: false,
@@ -21,6 +22,95 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
     const helperTime = useRef(4800);
     const rightDown = useRef(false);
     const leftDown = useRef(false);
+
+    // CTSP Panel States
+    const [searchQuery, setSearchQuery] = useState("");
+    const [searchResults, setSearchResults] = useState([]);
+    const [searchLoading, setSearchLoading] = useState(false);
+    const [elbowData, setElbowDataState] = useState([]);
+
+    useEffect(() => {
+        if (routingMode === "clustered" && deliveryStops.length >= 2) {
+            const data = getElbowData(deliveryStops, Math.min(deliveryStops.length, 8));
+            setElbowDataState(data);
+        } else {
+            setElbowDataState([]);
+        }
+    }, [deliveryStops, routingMode]);
+
+    const handleSearch = async () => {
+        if (!searchQuery) return;
+        setSearchLoading(true);
+        try {
+            const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(searchQuery)}&format=json&limit=5`, {
+                headers: { "User-Agent": "Map-Pathfinding-Visualizer-CTSP" }
+            });
+            const data = await res.json();
+            setSearchResults(data);
+        } catch (err) {
+            setSnack({ open: true, message: "Address search failed.", type: "error" });
+        } finally {
+            setSearchLoading(false);
+        }
+    };
+
+    const handleAddSearchedStop = (res) => {
+        setSearchResults([]);
+        setSearchQuery("");
+        const lat = parseFloat(res.lat);
+        const lon = parseFloat(res.lon);
+        
+        if (!graph) {
+            // Fly to location
+            changeLocation({ latitude: lat, longitude: lon });
+            setSnack({ open: true, message: "Location found. Click on the map to place the DEPOT.", type: "info" });
+            return;
+        }
+
+        // Snap coordinates
+        let nearestNode = null;
+        let minDist = Infinity;
+        for (const node of graph.nodes.values()) {
+            const d = Math.pow(node.latitude - lat, 2) + Math.pow(node.longitude - lon, 2);
+            if (d < minDist) {
+                minDist = d;
+                nearestNode = node;
+            }
+        }
+
+        if (!nearestNode || minDist > 0.01) {
+            setSnack({ open: true, message: "Location is too far from the selection radius.", type: "error" });
+            return;
+        }
+
+        if (deliveryStops.some(s => s.id === nearestNode.id)) {
+            setSnack({ open: true, message: "This stop has already been added.", type: "warning" });
+            return;
+        }
+
+        const newStop = {
+            id: nearestNode.id,
+            lat: nearestNode.latitude,
+            lon: nearestNode.longitude,
+            address: res.display_name.split(",").slice(0, 3).join(",")
+        };
+
+        setDeliveryStops(prev => [...prev, newStop]);
+        setOptimizedRouteData(null);
+        clearPath();
+    };
+
+    const handleDeleteStop = (idxToDelete) => {
+        setDeliveryStops(prev => prev.filter((_, idx) => idx !== idxToDelete));
+        setOptimizedRouteData(null);
+        clearPath();
+    };
+
+    const handleClearAllStops = () => {
+        setDeliveryStops([]);
+        setOptimizedRouteData(null);
+        clearPath();
+    };
 
     // Expose showSnack to parent from ref
     useImperativeHandle(ref, () => ({
@@ -468,6 +558,195 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
                     <path fill="#2A2B37" d="M0,0 L115,115 L130,115 L142,142 L250,250 L250,0 Z"></path><path d="M128.3,109.0 C113.8,99.7 119.0,89.6 119.0,89.6 C122.0,82.7 120.5,78.6 120.5,78.6 C119.2,72.0 123.4,76.3 123.4,76.3 C127.3,80.9 125.5,87.3 125.5,87.3 C122.9,97.6 130.6,101.9 134.4,103.2" fill="currentColor" className="octo-arm"></path><path d="M115.0,115.0 C114.9,115.1 118.7,116.5 119.8,115.4 L133.7,101.6 C136.9,99.2 139.9,98.4 142.2,98.6 C133.8,88.0 127.5,74.4 143.8,58.0 C148.5,53.4 154.0,51.2 159.7,51.0 C160.3,49.4 163.2,43.6 171.4,40.1 C171.4,40.1 176.1,42.5 178.8,56.2 C183.1,58.6 187.2,61.8 190.9,65.4 C194.5,69.0 197.7,73.2 200.1,77.6 C213.8,80.2 216.3,84.9 216.3,84.9 C212.7,93.1 206.9,96.0 205.4,96.6 C205.1,102.4 203.0,107.8 198.3,112.5 C181.9,128.9 168.3,122.5 157.7,114.1 C157.9,116.9 156.7,120.9 152.7,124.9 L141.0,136.5 C139.8,137.7 141.6,141.9 141.8,141.8 Z" fill="currentColor" className="octo-body"></path>
                 </svg>
             </a>
+
+            {/* Mode Toggle Button Group */}
+            <div className={`nav-left-top ${cinematic ? "cinematic" : ""}`}>
+                <div className="mode-toggle-card">
+                    <button 
+                        onClick={() => { setRoutingMode("single"); clearPath(); }}
+                        className={routingMode === "single" ? "mode-btn active" : "mode-btn"}
+                    >
+                        Single Route
+                    </button>
+                    <button 
+                        onClick={() => { setRoutingMode("clustered"); clearPath(); }}
+                        className={routingMode === "clustered" ? "mode-btn active" : "mode-btn"}
+                    >
+                        Clustered Delivery
+                    </button>
+                </div>
+            </div>
+
+            {/* Clustered Panel */}
+            {routingMode === "clustered" && !cinematic && (
+                <div className="clustered-floating-panel">
+                    <Typography variant="h6" className="panel-title">
+                        Clustered Delivery Routing (CTSP)
+                    </Typography>
+                    
+                    {/* Search Stop */}
+                    <div className="search-section">
+                        <Typography variant="caption" className="section-label">ADD STOP BY ADDRESS</Typography>
+                        <div className="search-bar">
+                            <input 
+                                type="text" 
+                                placeholder="Search location..."
+                                value={searchQuery}
+                                onChange={e => setSearchQuery(e.target.value)}
+                                onKeyDown={e => e.key === "Enter" && handleSearch()}
+                            />
+                            <Button onClick={handleSearch} disabled={searchLoading}>
+                                {searchLoading ? <CircularProgress size={16} /> : "Search"}
+                            </Button>
+                        </div>
+                        {searchResults.length > 0 && (
+                            <div className="search-results-dropdown">
+                                {searchResults.map((res, idx) => (
+                                    <div 
+                                        key={idx} 
+                                        className="search-result-item"
+                                        onClick={() => handleAddSearchedStop(res)}
+                                    >
+                                        {res.display_name.split(",").slice(0, 3).join(",")}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Stops List */}
+                    <div className="stops-section">
+                        <div className="section-header">
+                            <Typography variant="caption" className="section-label">
+                                DELIVERY STOPS ({deliveryStops.length})
+                            </Typography>
+                            {deliveryStops.length > 0 && (
+                                <button onClick={handleClearAllStops} className="clear-btn">Clear All</button>
+                            )}
+                        </div>
+                        {deliveryStops.length === 0 ? (
+                            <div className="empty-stops-placeholder">
+                                {graph ? "Click inside the selection radius or search above to add stops." : "First place a DEPOT on the map."}
+                            </div>
+                        ) : (
+                            <div className="stops-list">
+                                {deliveryStops.map((stop, idx) => (
+                                    <div key={stop.id} className="stop-item">
+                                        <span className="stop-badge">D{idx + 1}</span>
+                                        <span className="stop-address" title={stop.address}>{stop.address}</span>
+                                        <button onClick={() => handleDeleteStop(idx)} className="delete-btn">&times;</button>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Zone Settings & Elbow chart */}
+                    {deliveryStops.length > 0 && (
+                        <div className="zones-section">
+                            <Typography id="k-slider-label" className="section-label">
+                                NUMBER OF ZONES (k): {k}
+                            </Typography>
+                            <Slider 
+                                min={1} 
+                                max={Math.max(1, Math.min(deliveryStops.length, 8))} 
+                                step={1} 
+                                value={k} 
+                                onChange={e => {
+                                    setK(Number(e.target.value));
+                                    setOptimizedRouteData(null);
+                                }}
+                                className="slider"
+                            />
+                            
+                            {elbowData.length > 1 && (
+                                <div className="elbow-chart-container">
+                                    <Typography variant="caption" className="chart-label">
+                                        Elbow Curve (Optimal k Recommendation)
+                                    </Typography>
+                                    <div className="svg-wrapper">
+                                        <svg viewBox="0 0 200 80" className="elbow-svg">
+                                            <polyline
+                                                fill="none"
+                                                stroke="#46B780"
+                                                strokeWidth="2.5"
+                                                strokeLinecap="round"
+                                                strokeLinejoin="round"
+                                                points={elbowData.map((d, idx) => {
+                                                    const x = 20 + (idx * (160 / (elbowData.length - 1)));
+                                                    const maxWcss = Math.max(...elbowData.map(ed => ed.wcss));
+                                                    const minWcss = Math.min(...elbowData.map(ed => ed.wcss));
+                                                    const y = 65 - ((d.wcss - minWcss) / (maxWcss - minWcss || 1)) * 50;
+                                                    return `${x},${y}`;
+                                                }).join(" ")}
+                                            />
+                                            {elbowData.map((d, idx) => {
+                                                const x = 20 + (idx * (160 / (elbowData.length - 1)));
+                                                const maxWcss = Math.max(...elbowData.map(ed => ed.wcss));
+                                                const minWcss = Math.min(...elbowData.map(ed => ed.wcss));
+                                                const y = 65 - ((d.wcss - minWcss) / (maxWcss - minWcss || 1)) * 50;
+                                                const isSelected = d.k === k;
+                                                return (
+                                                    <g key={d.k}>
+                                                        <circle 
+                                                            cx={x} cy={y} r={isSelected ? 4.5 : 3} 
+                                                            fill={isSelected ? "#FFC107" : "#46B780"} 
+                                                            className={isSelected ? "selected-node" : ""}
+                                                        />
+                                                        <text x={x} y={78} fontSize="8" fill="#A8AFB3" textAnchor="middle" fontWeight={isSelected ? "bold" : "normal"}>{d.k}</text>
+                                                    </g>
+                                                );
+                                            })}
+                                        </svg>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Stats Dashboard */}
+                    {optimizedRouteData && (
+                        <div className="stats-section">
+                            <Typography variant="caption" className="section-label">ROUTING METRICS</Typography>
+                            
+                            <div className="comparison-container">
+                                <div className="route-stat naive">
+                                    <div className="stat-label">Naive Route</div>
+                                    <div className="stat-val">{optimizedRouteData.stats.naiveDistance.toFixed(2)} km</div>
+                                    <div className="stat-sub">{optimizedRouteData.stats.naiveCrossings} crossings</div>
+                                </div>
+                                <div className="route-stat optimized">
+                                    <div className="stat-label">Optimized CTSP</div>
+                                    <div className="stat-val">{optimizedRouteData.stats.optimizedDistance.toFixed(2)} km</div>
+                                    <div className="stat-sub">{optimizedRouteData.stats.optimizedCrossings} crossings</div>
+                                </div>
+                            </div>
+
+                            <div className="stats-highlight-cards">
+                                <div className="highlight-card savings">
+                                    <div className="card-label">Distance Saved</div>
+                                    <div className="card-val">{optimizedRouteData.stats.distanceSaved.toFixed(2)} km</div>
+                                    <div className="card-badge">-{optimizedRouteData.stats.percentageReduction.toFixed(1)}%</div>
+                                </div>
+                                <div className="highlight-card crossings">
+                                    <div className="card-label">Crossings Saved</div>
+                                    <div className="card-val">{optimizedRouteData.stats.crossingsSaved}</div>
+                                </div>
+                            </div>
+
+                            <div className="checkbox-container">
+                                <input 
+                                    type="checkbox" 
+                                    id="show-naive-checkbox"
+                                    checked={showNaiveRoute}
+                                    onChange={e => setShowNaiveRoute(e.target.checked)}
+                                />
+                                <label htmlFor="show-naive-checkbox">Show Naive Route (Overlay)</label>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            )}
         </>
     );
 });
