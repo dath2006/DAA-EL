@@ -329,6 +329,77 @@ function reverseSubArray(arr, start, end) {
 }
 
 /**
+ * Solve TSP exactly using Held-Karp Dynamic Programming.
+ * O(n^2 * 2^n) time complexity. Hard limited to 18 stops.
+ */
+export function solveTspHeldKarp(stops, distanceMatrix) {
+    const n = stops.length;
+    if (n === 0) return [];
+    if (n === 1) return [0];
+    if (n === 2) return [0, 1];
+
+    if (n > 18) {
+        throw new Error(`Held-Karp algorithm cannot handle more than 18 stops per cluster due to memory/time constraints. You currently have ${n} stops in one cluster. Please use Nearest Neighbor or increase the number of clusters (k).`);
+    }
+
+    const numStates = 1 << n;
+    // dp[mask][i] = min distance to visit 'mask' ending at 'i'
+    const dp = Array.from({ length: numStates }, () => new Float32Array(n).fill(Infinity));
+    const parent = Array.from({ length: numStates }, () => new Int32Array(n).fill(-1));
+
+    // Base case: starting at node 0
+    dp[1][0] = 0;
+
+    for (let mask = 1; mask < numStates; mask += 2) {
+        for (let u = 0; u < n; u++) {
+            if ((mask & (1 << u)) === 0) continue;
+            
+            for (let v = 0; v < n; v++) {
+                if ((mask & (1 << v)) !== 0) continue;
+                
+                const nextMask = mask | (1 << v);
+                const newDist = dp[mask][u] + distanceMatrix[u][v];
+                
+                if (newDist < dp[nextMask][v]) {
+                    dp[nextMask][v] = newDist;
+                    parent[nextMask][v] = u;
+                }
+            }
+        }
+    }
+
+    // Connect back to 0
+    let bestDist = Infinity;
+    let endNode = -1;
+    const fullMask = numStates - 1;
+
+    for (let u = 1; u < n; u++) {
+        const dist = dp[fullMask][u] + distanceMatrix[u][0];
+        if (dist < bestDist) {
+            bestDist = dist;
+            endNode = u;
+        }
+    }
+
+    if (endNode === -1) return [];
+
+    // Traceback
+    const tour = [];
+    let currentMask = fullMask;
+    let curr = endNode;
+    
+    while (curr !== -1) {
+        tour.push(curr);
+        const p = parent[currentMask][curr];
+        currentMask ^= (1 << curr);
+        curr = p;
+    }
+    
+    tour.reverse();
+    return tour;
+}
+
+/**
  * Sequences clusters by centroids using Nearest Neighbor from Depot
  */
 export function sequenceZones(depot, zones) {
@@ -450,7 +521,7 @@ export function countCrossings(pathPoints) {
 /**
  * Full pipeline solver for Clustered TSP (CTSP)
  */
-export function solveClusteredTsp(depot, stops, k, graph, algorithmName = "astar") {
+export function solveClusteredTsp(depot, stops, k, graph, algorithmName = "astar", tspAlgorithm = "nn_2opt") {
     if (!depot || stops.length === 0 || !graph) return null;
 
     // 1. Assign zones using K-Means
@@ -511,7 +582,12 @@ export function solveClusteredTsp(depot, stops, k, graph, algorithmName = "astar
         }
 
         // Solve TSP on this cluster
-        const tspTourIdxs = solveTspNearestNeighbor2Opt(clusterStops, distMatrix);
+        let tspTourIdxs;
+        if (tspAlgorithm === "held_karp") {
+            tspTourIdxs = solveTspHeldKarp(clusterStops, distMatrix);
+        } else {
+            tspTourIdxs = solveTspNearestNeighbor2Opt(clusterStops, distMatrix);
+        }
         clusterTours.push({
             clusterId: cluster.id,
             stops: tspTourIdxs.map(idx => clusterStops[idx]),
@@ -858,7 +934,7 @@ export function findElbowK(elbowData) {
  *   finalResult: { ...same shape as solveClusteredTsp }
  * }
  */
-export function solveClusteredTspStepwise(depot, stops, k, graph, algorithmName = "astar") {
+export function solveClusteredTspStepwise(depot, stops, k, graph, algorithmName = "astar", tspAlgorithm = "nn_2opt") {
     if (!depot || stops.length === 0 || !graph) return null;
 
     // ── Phase 1: K-Means with captured frames ──────────────────────────────
@@ -980,56 +1056,71 @@ export function solveClusteredTspStepwise(depot, stops, k, graph, algorithmName 
             }
         }
 
-        // NN tour
-        const nnTour = [0];
-        const visited = new Set([0]);
-        let current = 0;
-        while (nnTour.length < m) {
-            let nextNode = -1, minDist = Infinity;
-            for (let i = 0; i < m; i++) {
-                if (!visited.has(i) && distMatrix[current][i] < minDist) {
-                    minDist = distMatrix[current][i]; nextNode = i;
-                }
+        let finalTour;
+        let nnPathSegments = [];
+        let twoOptSwaps = [];
+
+        if (tspAlgorithm === "held_karp") {
+            finalTour = solveTspHeldKarp(cluster.stops, distMatrix);
+            // Treat the optimal tour as the only "NN" segment and zero swaps
+            for (let i = 0; i < m - 1; i++) {
+                const p = pathMatrix[finalTour[i]][finalTour[i + 1]] || [stopNodes[finalTour[i]], stopNodes[finalTour[i + 1]]];
+                nnPathSegments.push({ path: p, label: `Held-Karp: stop ${i + 1} → ${i + 2}` });
             }
-            nnTour.push(nextNode); visited.add(nextNode); current = nextNode;
-        }
+            if (m > 1) {
+                const p = pathMatrix[finalTour[m - 1]][finalTour[0]] || [stopNodes[finalTour[m - 1]], stopNodes[finalTour[0]]];
+                nnPathSegments.push({ path: p, label: `Held-Karp: closing loop` });
+            }
+        } else {
+            // NN tour
+            const nnTour = [0];
+            const visited = new Set([0]);
+            let current = 0;
+            while (nnTour.length < m) {
+                let nextNode = -1, minDist = Infinity;
+                for (let i = 0; i < m; i++) {
+                    if (!visited.has(i) && distMatrix[current][i] < minDist) {
+                        minDist = distMatrix[current][i]; nextNode = i;
+                    }
+                }
+                nnTour.push(nextNode); visited.add(nextNode); current = nextNode;
+            }
 
-        // Build NN path segments for animation
-        const nnPathSegments = [];
-        for (let i = 0; i < m - 1; i++) {
-            const p = pathMatrix[nnTour[i]][nnTour[i + 1]] || [stopNodes[nnTour[i]], stopNodes[nnTour[i + 1]]];
-            nnPathSegments.push({ path: p, label: `NN: stop ${i + 1} → ${i + 2}` });
-        }
-        // Close loop
-        if (m > 1) {
-            const p = pathMatrix[nnTour[m - 1]][nnTour[0]] || [stopNodes[nnTour[m - 1]], stopNodes[nnTour[0]]];
-            nnPathSegments.push({ path: p, label: `NN: closing loop` });
-        }
+            // Build NN path segments for animation
+            for (let i = 0; i < m - 1; i++) {
+                const p = pathMatrix[nnTour[i]][nnTour[i + 1]] || [stopNodes[nnTour[i]], stopNodes[nnTour[i + 1]]];
+                nnPathSegments.push({ path: p, label: `NN: stop ${i + 1} → ${i + 2}` });
+            }
+            // Close loop
+            if (m > 1) {
+                const p = pathMatrix[nnTour[m - 1]][nnTour[0]] || [stopNodes[nnTour[m - 1]], stopNodes[nnTour[0]]];
+                nnPathSegments.push({ path: p, label: `NN: closing loop` });
+            }
 
-        // 2-opt improvements — capture each swap
-        const tour = [...nnTour];
-        const twoOptSwaps = [];
-        let improved = true;
-        let iteration = 0;
-        while (improved && iteration < 500) {
-            improved = false; iteration++;
-            for (let i = 1; i < m - 1; i++) {
-                for (let j = i + 1; j < m; j++) {
-                    const a = tour[i - 1], b = tour[i], c = tour[j], d = tour[(j + 1) % m];
-                    const oldDist = distMatrix[a][b] + distMatrix[c][d];
-                    const newDist = distMatrix[a][c] + distMatrix[b][d];
-                    if (newDist < oldDist - 1e-9) {
-                        reverseSubArray(tour, i, j);
-                        improved = true;
-                        // Capture the improved tour as a sequence of path segments
-                        const swapSegments = [];
-                        for (let k = 0; k < m - 1; k++) {
-                            const p = pathMatrix[tour[k]][tour[k + 1]] || [stopNodes[tour[k]], stopNodes[tour[k + 1]]];
-                            swapSegments.push({ path: p });
+            // 2-opt improvements — capture each swap
+            finalTour = [...nnTour];
+            let improved = true;
+            let iteration = 0;
+            while (improved && iteration < 500) {
+                improved = false; iteration++;
+                for (let i = 1; i < m - 1; i++) {
+                    for (let j = i + 1; j < m; j++) {
+                        const a = finalTour[i - 1], b = finalTour[i], c = finalTour[j], d = finalTour[(j + 1) % m];
+                        const oldDist = distMatrix[a][b] + distMatrix[c][d];
+                        const newDist = distMatrix[a][c] + distMatrix[b][d];
+                        if (newDist < oldDist - 1e-9) {
+                            reverseSubArray(finalTour, i, j);
+                            improved = true;
+                            // Capture the improved tour as a sequence of path segments
+                            const swapSegments = [];
+                            for (let k = 0; k < m - 1; k++) {
+                                const p = pathMatrix[finalTour[k]][finalTour[k + 1]] || [stopNodes[finalTour[k]], stopNodes[finalTour[k + 1]]];
+                                swapSegments.push({ path: p });
+                            }
+                            const closeP = pathMatrix[finalTour[m - 1]][finalTour[0]] || [stopNodes[finalTour[m - 1]], stopNodes[finalTour[0]]];
+                            swapSegments.push({ path: closeP });
+                            twoOptSwaps.push({ segments: swapSegments, improvement: oldDist - newDist });
                         }
-                        const closeP = pathMatrix[tour[m - 1]][tour[0]] || [stopNodes[tour[m - 1]], stopNodes[tour[0]]];
-                        swapSegments.push({ path: closeP });
-                        twoOptSwaps.push({ segments: swapSegments, improvement: oldDist - newDist });
                     }
                 }
             }
@@ -1041,14 +1132,14 @@ export function solveClusteredTspStepwise(depot, stops, k, graph, algorithmName 
             stopCount: m,         // exact number of stops in this zone
             nnSegments: nnPathSegments,
             twoOptSwaps, // can be empty if no improvement found
-            finalTour: tour,
-            finalSegments: tour.map((idx, i) => {
-                const nextIdx = tour[(i + 1) % m];
+            finalTour: finalTour,
+            finalSegments: finalTour.map((idx, i) => {
+                const nextIdx = finalTour[(i + 1) % m];
                 return pathMatrix[idx][nextIdx] || [stopNodes[idx], stopNodes[nextIdx]];
             })
         });
 
-        clusterTours.push({ clusterId: cluster.id, stops: tour.map(i => cluster.stops[i]), nodes: tour.map(i => stopNodes[i]), distMatrix, pathMatrix, tourOrder: tour });
+        clusterTours.push({ clusterId: cluster.id, stops: finalTour.map(i => cluster.stops[i]), nodes: finalTour.map(i => stopNodes[i]), distMatrix, pathMatrix, tourOrder: finalTour });
     }
 
     // ── Phase 3: Zone linking ──────────────────────────────────────────────
@@ -1186,6 +1277,7 @@ export function solveClusteredTspStepwise(depot, stops, k, graph, algorithmName 
 
     const finalResult = {
         optimizedRoute: linkingSegments,
+        naiveRoute: finalNaiveRoute,
         stats: {
             naiveDistance: naiveDistance,
             optimizedDistance: totalOptimizedDistance,

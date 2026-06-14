@@ -42,7 +42,7 @@ function Map() {
     const [cinematic, setCinematic] = useState(false);
     const [placeEnd, setPlaceEnd] = useState(false);
     const [loading, setLoading] = useState(false);
-    const [settings, setSettings] = useState({ algorithm: "astar", radius: 4, speed: 5 });
+    const [settings, setSettings] = useState({ algorithm: "astar", radius: 4, speed: 5, tspAlgorithm: "nn_2opt" });
     const [colors, setColors] = useState(INITIAL_COLORS);
     const [viewState, setViewState] = useState(INITIAL_VIEW_STATE);
     const [mapStyle, setMapStyle] = useState(() => {
@@ -61,6 +61,7 @@ function Map() {
 
     // Comparison paths state
     const [comparisonPaths, setComparisonPaths] = useState([]);
+    const [hiddenComparisonPaths, setHiddenComparisonPaths] = useState(new Set());
 
     // Stepwise animation states
     const [animationPhase, setAnimationPhase] = useState(0); // 0-3
@@ -233,8 +234,8 @@ function Map() {
     function startClusteredAnimation() {
         if (!startNode || deliveryStops.length === 0) return;
 
-        const depot = { id: startNode.id, lat: startNode.lat, lon: startNode.lon };
-        const result = solveClusteredTspStepwise(depot, deliveryStops, k, state.current.graph, settings.algorithm);
+        const depot = { id: startNode.id, lat: startNode.latitude ?? startNode.lat, lon: startNode.longitude ?? startNode.lon };
+        const result = solveClusteredTspStepwise(depot, deliveryStops, k, state.current.graph, settings.algorithm, settings.tspAlgorithm);
 
         if (!result) {
             ui.current.showSnack("Failed to solve Clustered TSP routing.");
@@ -585,6 +586,7 @@ function Map() {
         setZoneSwapIdx(0);
         setSubstepStatus("idle");
         setComparisonPaths([]); // clear comparison paths
+        setHiddenComparisonPaths(new Set()); // clear hidden paths
         if (clusterFrameTimer.current) clearInterval(clusterFrameTimer.current);
     }
 
@@ -739,7 +741,7 @@ function Map() {
         // (phaseData being set means animation is running — skip to avoid extra cluster renders)
         if (routingMode === "clustered" && startNode && deliveryStops.length > 0 && state.current.graph && !phaseData) {
             const depot = { id: startNode.id, lat: startNode.lat, lon: startNode.lon };
-            const data = solveClusteredTsp(depot, deliveryStops, k, state.current.graph, settings.algorithm);
+            const data = solveClusteredTsp(depot, deliveryStops, k, state.current.graph, settings.algorithm, settings.tspAlgorithm);
             setOptimizedRouteData(data);
         } else if (!phaseData) {
             setOptimizedRouteData(null);
@@ -1034,7 +1036,7 @@ function Map() {
                     {comparisonPaths && comparisonPaths.length > 0 && (
                         <PathLayer
                             id="comparison-paths"
-                            data={comparisonPaths}
+                            data={comparisonPaths.filter(p => !hiddenComparisonPaths.has(p.name))}
                             pickable={true}
                             widthScale={1}
                             widthMinPixels={3}
@@ -1045,7 +1047,9 @@ function Map() {
                                     "astar": [255, 60, 60, 200],
                                     "dijkstra": [60, 150, 255, 200],
                                     "greedy": [60, 255, 100, 200],
-                                    "bidirectional": [200, 60, 255, 200]
+                                    "bidirectional": [200, 60, 255, 200],
+                                    "nn_2opt": [60, 150, 255, 200], // blue
+                                    "held_karp": [255, 60, 60, 200] // red
                                 };
                                 return COMPARISON_COLORS[d.name] || [255, 255, 255, 200];
                             }}
@@ -1054,7 +1058,9 @@ function Map() {
                                     "astar": 8,
                                     "dijkstra": 6,
                                     "greedy": 4,
-                                    "bidirectional": 10
+                                    "bidirectional": 10,
+                                    "nn_2opt": 8,
+                                    "held_karp": 4
                                 };
                                 return COMPARISON_WIDTHS[d.name] || 4;
                             }}
@@ -1112,6 +1118,8 @@ function Map() {
                 startNodeObj={state.current.startNode}
                 endNodeObj={state.current.endNode}
                 setComparisonPaths={setComparisonPaths}
+                hiddenComparisonPaths={hiddenComparisonPaths}
+                setHiddenComparisonPaths={setHiddenComparisonPaths}
 
                 animationPhase={animationPhase}
                 phaseData={phaseData}

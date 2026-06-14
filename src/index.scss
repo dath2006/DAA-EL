@@ -998,7 +998,7 @@ canvas {
     box-shadow: 0 4px 15px rgba(0,0,0,0.3);
     border: 1px solid rgba(255,255,255,0.1);
     transition: all 0.2s;
-    z-index: 100;
+    z-index: 2000;
     
     &:hover {
         background: rgba(60, 60, 60, 0.95);
@@ -1016,7 +1016,7 @@ canvas {
     border-radius: 12px;
     border: 1px solid rgba(255,255,255,0.1);
     box-shadow: 0 8px 30px rgba(0,0,0,0.5);
-    z-index: 100;
+    z-index: 2000;
     display: flex;
     flex-direction: column;
     color: #eee;

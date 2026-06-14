@@ -6,10 +6,10 @@ import { useState, useEffect, useRef, useImperativeHandle, forwardRef } from "re
 import { INITIAL_COLORS, LOCATIONS } from "../config";
 import { arrayToRgb, rgbToArray } from "../helpers";
 import { getElbowData, findElbowK } from "../services/RoutingService";
-import { runComparison } from "../services/ComparisonService";
+import { runComparison, runClusteredComparison } from "../services/ComparisonService";
 import { MdBarChart } from "react-icons/md";
 
-const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, time, maxTime, settings, colors, loading, timeChanged, cinematic, placeEnd, changeRadius, changeAlgorithm, setPlaceEnd, setCinematic, setSettings, setColors, startPathfinding, toggleAnimation, clearPath, changeLocation, mapStyle, changeMapStyle, routingMode, setRoutingMode, singleRenderMode, setSingleRenderMode, showGraphNodes, setShowGraphNodes, deliveryStops, setDeliveryStops, k, setK, showNaiveRoute, setShowNaiveRoute, optimizedRouteData, setOptimizedRouteData, graph, startNodeObj, endNodeObj, setComparisonPaths, animationPhase, phaseData, clusterFrame, clusteringDone, currentZoneIdx, zoneNNDone, zoneSwapIdx, advanceToPhase, substepStatus, runNextSubstep }, ref) => {
+const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, time, maxTime, settings, colors, loading, timeChanged, cinematic, placeEnd, changeRadius, changeAlgorithm, setPlaceEnd, setCinematic, setSettings, setColors, startPathfinding, toggleAnimation, clearPath, changeLocation, mapStyle, changeMapStyle, routingMode, setRoutingMode, singleRenderMode, setSingleRenderMode, showGraphNodes, setShowGraphNodes, deliveryStops, setDeliveryStops, k, setK, showNaiveRoute, setShowNaiveRoute, optimizedRouteData, setOptimizedRouteData, graph, startNodeObj, endNodeObj, setComparisonPaths, hiddenComparisonPaths, setHiddenComparisonPaths, animationPhase, phaseData, clusterFrame, clusteringDone, currentZoneIdx, zoneNNDone, zoneSwapIdx, advanceToPhase, substepStatus, runNextSubstep }, ref) => {
     const [sidebar, setSidebar] = useState(false);
     const [snack, setSnack] = useState({
         open: false,
@@ -24,6 +24,11 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
     const [comparisonResults, setComparisonResults] = useState(null);
     const [isComparing, setIsComparing] = useState(false);
 
+    // Clustered Comparison States
+    const [showClusteredComparisonMenu, setShowClusteredComparisonMenu] = useState(false);
+    const [isClusteredComparing, setIsClusteredComparing] = useState(false);
+    const [clusteredComparisonResults, setClusteredComparisonResults] = useState(null);
+
     const handleAlgoToggle = (algo, checked) => {
         if (checked) {
             setSelectedComparisonAlgos([...selectedComparisonAlgos, algo]);
@@ -37,6 +42,7 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
         setIsComparing(true);
         setComparisonResults(null);
         setComparisonPaths([]);
+        setHiddenComparisonPaths(new Set());
         setTimeout(async () => {
             const results = await runComparison(selectedComparisonAlgos, graph, startNodeObj, endNodeObj);
             setComparisonResults(results);
@@ -45,6 +51,24 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
                 path: r.path.map(node => [node.longitude ?? node.lon, node.latitude ?? node.lat])
             })));
             setIsComparing(false);
+        }, 50);
+    };
+
+    const handleRunClusteredComparison = async () => {
+        if (!graph || !startNodeObj || deliveryStops.length === 0) return;
+        setIsClusteredComparing(true);
+        setClusteredComparisonResults(null);
+        setComparisonPaths([]);
+        setHiddenComparisonPaths(new Set());
+        setTimeout(async () => {
+            const depot = { id: startNodeObj.id, lat: startNodeObj.latitude ?? startNodeObj.lat, lon: startNodeObj.longitude ?? startNodeObj.lon };
+            const results = await runClusteredComparison(depot, deliveryStops, k, graph, settings.algorithm);
+            setClusteredComparisonResults(results);
+            setComparisonPaths(results.filter(r => r.path && r.path.length > 0).map(r => ({
+                name: r.name,
+                path: r.path.map(node => [node.longitude ?? node.lon, node.latitude ?? node.lat])
+            })));
+            setIsClusteredComparing(false);
         }, 50);
     };
 
@@ -77,6 +101,44 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
 
         return insights.map((msg, idx) => <span key={idx} style={{ display: 'block', marginBottom: '8px' }}>{msg}</span>);
     };
+
+    const togglePathVisibility = (algoName) => {
+        setHiddenComparisonPaths(prev => {
+            const next = new Set(prev);
+            if (next.has(algoName)) next.delete(algoName);
+            else next.add(algoName);
+            return next;
+        });
+    };
+
+    const generateClusteredDaaInsights = (results) => {
+        if (!results || results.length < 2) return "Run comparison to see insights.";
+        const insights = [];
+        const nn = results.find(r => r.name === "nn_2opt");
+        const hk = results.find(r => r.name === "held_karp");
+
+        if (nn && hk) {
+            const timeDiffMs = hk.executionTimeMs - nn.executionTimeMs;
+            const distDiffKm = nn.distanceKm - hk.distanceKm;
+
+            if (distDiffKm > 0.001) {
+                insights.push(`Optimality: Held-Karp found a more optimal route, saving ${distDiffKm.toFixed(2)} km compared to NN + 2-Opt.`);
+            } else {
+                insights.push(`Optimality: NN + 2-Opt was able to find a route as optimal as Held-Karp's exact solution!`);
+            }
+
+            if (timeDiffMs > 0) {
+                insights.push(`Time Complexity: Held-Karp's O(n^2 * 2^n) time complexity took ${timeDiffMs.toFixed(2)} ms longer than NN's heuristic O(n^2) approach.`);
+            }
+
+            if (nn.crossings > hk.crossings) {
+                insights.push(`Crossings: Held-Karp resulted in ${nn.crossings - hk.crossings} fewer path crossings, indicating a visually cleaner route.`);
+            }
+        }
+        return insights.map((msg, idx) => <span key={`cl-ins-${idx}`} style={{ display: 'block', marginBottom: '8px' }}>{msg}</span>);
+    };
+
+
 
     const [showTutorial, setShowTutorial] = useState(false);
     const [activeStep, setActiveStep] = useState(0);
@@ -390,8 +452,14 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
             {routingMode === "single" && (
                 <div className="comparison-toggle" onClick={() => setShowComparisonMenu(true)}>
                     <MdBarChart />
-
                     <span>Compare</span>
+                </div>
+            )}
+            
+            {routingMode === "clustered" && (
+                <div className="comparison-toggle" onClick={() => setShowClusteredComparisonMenu(true)}>
+                    <MdBarChart />
+                    <span>Compare TSP</span>
                 </div>
             )}
 
@@ -441,8 +509,18 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
                                             return (
                                                 <tr key={res.name} className={!res.pathFound ? "failed-path" : ""}>
                                                     <td style={{ textAlign: "left", display: "flex", alignItems: "center", gap: "8px" }}>
-                                                        <div style={{ width: "12px", height: "12px", borderRadius: "50%", background: COMPARISON_COLORS[res.name] || "#FFF" }} />
-                                                        {res.displayName}
+                                                        <div style={{ width: "12px", height: "12px", borderRadius: "50%", background: COMPARISON_COLORS[res.name] || "#FFF", flexShrink: 0 }} />
+                                                        <span style={{ flexGrow: 1 }}>{res.displayName}</span>
+                                                        {res.pathFound && (
+                                                            <i 
+                                                                className="material-icons" 
+                                                                style={{ fontSize: "16px", cursor: "pointer", color: hiddenComparisonPaths?.has(res.name) ? "#666" : "#fff", padding: "2px" }}
+                                                                onClick={() => togglePathVisibility(res.name)}
+                                                                title={hiddenComparisonPaths?.has(res.name) ? "Show Path" : "Hide Path"}
+                                                            >
+                                                                {hiddenComparisonPaths?.has(res.name) ? "visibility_off" : "visibility"}
+                                                            </i>
+                                                        )}
                                                     </td>
                                                     <td>{res.executionTimeMs.toFixed(2)}</td>
                                                     <td>{res.nodesExplored}</td>
@@ -457,6 +535,79 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
                                     <h4><i className="material-icons">lightbulb</i> DAA Insights</h4>
                                     <div className="insights-content">
                                         {generateDaaInsights(comparisonResults)}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
+
+            {/* Clustered Comparison Modal / Panel */}
+            {showClusteredComparisonMenu && (
+                <div className="comparison-panel" style={{ width: "420px" }}>
+                    <div className="panel-header">
+                        <h3>TSP Algorithm Comparison</h3>
+                        <i className="material-icons" style={{cursor: "pointer"}} onClick={() => setShowClusteredComparisonMenu(false)}>close</i>
+                    </div>
+                    
+                    <div className="panel-body">
+                        <p style={{ fontSize: '13px', margin: '0 0 15px 0', color: '#ccc' }}>
+                            Compares Nearest Neighbor + 2-Opt against the exact Held-Karp algorithm.
+                        </p>
+                        
+                        <button 
+                            className="run-comparison-btn" 
+                            disabled={!canStart || deliveryStops.length < 1 || isClusteredComparing}
+                            onClick={handleRunClusteredComparison}
+                        >
+                            {isClusteredComparing ? "Running Analysis..." : "Run Analysis"}
+                        </button>
+
+                        {clusteredComparisonResults && (
+                            <div className="comparison-results">
+                                <table className="comparison-table">
+                                    <thead>
+                                        <tr>
+                                            <th style={{ textAlign: "left" }}>Algorithm</th>
+                                            <th>Time (ms)</th>
+                                            <th>Distance (km)</th>
+                                            <th>Crossings</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {clusteredComparisonResults.map(res => {
+                                            const COMPARISON_COLORS = {
+                                                "nn_2opt": "#3C96FF",
+                                                "held_karp": "#FF3C3C"
+                                            };
+                                            return (
+                                                <tr key={res.name}>
+                                                    <td style={{ textAlign: "left", display: "flex", alignItems: "center", gap: "8px" }}>
+                                                        <div style={{ width: "12px", height: "12px", borderRadius: "50%", background: COMPARISON_COLORS[res.name] || "#FFF", flexShrink: 0 }} />
+                                                        <span style={{ flexGrow: 1 }}>{res.displayName}</span>
+                                                        <i 
+                                                            className="material-icons" 
+                                                            style={{ fontSize: "16px", cursor: "pointer", color: hiddenComparisonPaths?.has(res.name) ? "#666" : "#fff", padding: "2px" }}
+                                                            onClick={() => togglePathVisibility(res.name)}
+                                                            title={hiddenComparisonPaths?.has(res.name) ? "Show Path" : "Hide Path"}
+                                                        >
+                                                            {hiddenComparisonPaths?.has(res.name) ? "visibility_off" : "visibility"}
+                                                        </i>
+                                                    </td>
+                                                    <td>{res.executionTimeMs.toFixed(2)}</td>
+                                                    <td>{res.distanceKm ? res.distanceKm.toFixed(2) : 'N/A'}</td>
+                                                    <td>{res.crossings}</td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+
+                                <div className="daa-insights">
+                                    <h4><i className="material-icons">lightbulb</i> DAA Insights</h4>
+                                    <div className="insights-content">
+                                        {generateClusteredDaaInsights(clusteredComparisonResults)}
                                     </div>
                                 </div>
                             </div>
@@ -561,13 +712,34 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
                             <MenuItem value={"bidirectional"}>Bidirectional Search algorithm</MenuItem>
                         </Select>
                     </FormControl>
+                    {routingMode === "clustered" && (
+                        <FormControl variant="filled" style={{ marginTop: "10px", marginBottom: "10px" }}>
+                            <InputLabel style={{ fontSize: 14 }} id="tsp-algo-select">TSP Algorithm</InputLabel>
+                            <Select
+                                labelId="tsp-algo-select"
+                                value={settings.tspAlgorithm || "nn_2opt"}
+                                onChange={e => {
+                                    setSettings({ ...settings, tspAlgorithm: e.target.value });
+                                    setOptimizedRouteData(null);
+                                    clearPath();
+                                }}
+                                required
+                                style={{ backgroundColor: "#404156", color: "#fff", width: "100%", paddingLeft: 1 }}
+                                inputProps={{MenuProps: {MenuListProps: {sx: {backgroundColor: "#404156"}}}}}
+                                size="small"
+                                disabled={!animationEnded && started}
+                            >
+                                <MenuItem value={"nn_2opt"}>Nearest Neighbor + 2-Opt (Fast)</MenuItem>
+                                <MenuItem value={"held_karp"}>Held-Karp (Optimal, Max 18 stops)</MenuItem>
+                            </Select>
+                        </FormControl>
+                    )}
 
                     {routingMode === "clustered" && (
                         <div style={{ padding: "8px", backgroundColor: "rgba(0,0,0,0.2)", borderRadius: "4px", fontSize: "12px", color: "#ccc", marginTop: "-10px", marginBottom: "10px" }}>
                             <strong style={{ color: "#fff" }}>Clustered Algorithms in use:</strong><br/>
                             • <em>Clustering:</em> K-Means++<br/>
-                            • <em>Sequencing:</em> Nearest Neighbor<br/>
-                            • <em>Optimization:</em> 2-Opt<br/>
+                            • <em>TSP Method:</em> {settings.tspAlgorithm === 'held_karp' ? 'Held-Karp (Optimal)' : 'Nearest Neighbor + 2-Opt'}<br/>
                             • <em>Pathfinding:</em> {settings.algorithm === 'astar' ? 'A*' : settings.algorithm === 'dijkstra' ? "Dijkstra's" : settings.algorithm === 'greedy' ? 'Greedy' : 'Bidirectional'}
                         </div>
                     )}

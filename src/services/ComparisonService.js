@@ -2,8 +2,7 @@ import AStar from "../models/algorithms/AStar";
 import BidirectionalSearch from "../models/algorithms/BidirectionalSearch";
 import Dijkstra from "../models/algorithms/Dijkstra";
 import Greedy from "../models/algorithms/Greedy";
-import { getDistanceInKm } from "./RoutingService";
-
+import { getDistanceInKm, solveClusteredTsp } from "./RoutingService";
 /**
  * Runs a list of algorithms completely on the given graph and returns metrics.
  */
@@ -130,6 +129,53 @@ export async function runComparison(algorithms, graph, startNode, endNode) {
     }
 
     // Reset graph again so it's clean for the normal animation
+    for (const key of graph.nodes.keys()) {
+        graph.nodes.get(key).reset();
+    }
+
+    return results;
+}
+
+/**
+ * Runs Clustered TSP algorithms (NN+2Opt vs Held-Karp) on the given graph and returns metrics.
+ */
+export async function runClusteredComparison(depot, deliveryStops, k, graph, pathfindingAlgo) {
+    if (!depot || deliveryStops.length === 0 || !graph) return [];
+
+    const results = [];
+    const algos = [
+        { id: "nn_2opt", displayName: "NN + 2-Opt" },
+        { id: "held_karp", displayName: "Held-Karp (DP)" }
+    ];
+
+    for (const tspAlgo of algos) {
+        // Reset the graph for a clean run
+        for (const key of graph.nodes.keys()) {
+            graph.nodes.get(key).reset();
+        }
+
+        const startTime = performance.now();
+        const result = solveClusteredTsp(depot, deliveryStops, k, graph, pathfindingAlgo, tspAlgo.id);
+        const endTime = performance.now();
+        const executionTime = endTime - startTime;
+
+        if (result && result.stats) {
+            let finalPath = [];
+            if (result.optimizedRoute) {
+                finalPath = result.optimizedRoute.flatMap(seg => seg.path);
+            }
+            results.push({
+                name: tspAlgo.id,
+                displayName: tspAlgo.displayName,
+                executionTimeMs: executionTime,
+                distanceKm: result.stats.optimizedDistance,
+                crossings: result.stats.optimizedCrossings,
+                path: finalPath
+            });
+        }
+    }
+
+    // Reset graph
     for (const key of graph.nodes.keys()) {
         graph.nodes.get(key).reset();
     }
