@@ -24,7 +24,7 @@ export default class PathfindingState {
     }
 
     get startNode() {
-        return this.graph.startNode;
+        return this.graph?.startNode;
     }
 
     /**

@@ -60,7 +60,7 @@ export async function fetchOverpassData(boundingBox) {
             clearTimeout(timeoutId);
             if (error.name === "AbortError") {
                 console.warn(`Overpass server ${endpoint} request timed out after 8 seconds.`);
-                lastError = new Error(`Server request timed out after 8 seconds`);
+                lastError = new Error("Server request timed out after 8 seconds");
             } else {
                 console.error(`Failed to fetch from Overpass server ${endpoint}:`, error);
                 lastError = error;

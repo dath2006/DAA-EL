@@ -36,7 +36,7 @@ class BidirectionalSearch extends PathfindingAlgorithm {
             if(refEdge) refEdge.visited = true;
 
             // Intersected
-            if (this.openSetEnd.has(currentStart)) {
+            if (this.openSetEnd.has(currentStart) || this.closedSetEnd.has(currentStart)) {
                 this.finished = true;
                 console.log("found from start");
                 return [currentStart];
@@ -53,7 +53,7 @@ class BidirectionalSearch extends PathfindingAlgorithm {
             if(refEdge) refEdge.visited = true;
 
             // Intersected
-            if (this.openSetStart.has(currentEnd)) {
+            if (this.openSetStart.has(currentEnd) || this.closedSetStart.has(currentEnd)) {
                 console.log("found from end");
                 this.finished = true;
                 return [currentEnd];
@@ -79,10 +79,16 @@ class BidirectionalSearch extends PathfindingAlgorithm {
                 updatedNodes.push(neighbor);
             }
 
-            if (!closedSet.has(neighbor) && !neighbor.visited) {
+            const isVisitedByOther = (openSet === this.openSetStart) ? 
+                (this.closedSetEnd.has(neighbor) || this.openSetEnd.has(neighbor)) :
+                (this.closedSetStart.has(neighbor) || this.openSetStart.has(neighbor));
+
+            if (!closedSet.has(neighbor) && (!neighbor.visited || isVisitedByOther)) {
                 openSet.add(neighbor);
-                neighbor.prevParent = neighbor.parent;
-                neighbor.parent = node;
+                if (neighbor.parent !== node) {
+                    neighbor.prevParent = neighbor.parent;
+                    neighbor.parent = node;
+                }
                 neighbor.referer = node;
             }
         }

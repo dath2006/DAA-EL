@@ -11,7 +11,7 @@ import PathfindingState from "../models/PathfindingState";
 import Interface from "./Interface";
 import { INITIAL_COLORS, INITIAL_VIEW_STATE, MAP_STYLE } from "../config";
 import useSmoothStateChange from "../hooks/useSmoothStateChange";
-import { solveClusteredTsp } from "../services/RoutingService";
+import { solveClusteredTsp, solveClusteredTspStepwise } from "../services/RoutingService";
 
 function getNearestNodeLocal(latitude, longitude, graph) {
     if (!graph || !graph.nodes) return null;
@@ -52,10 +52,25 @@ function Map() {
 
     // CTSP Routing states
     const [routingMode, setRoutingMode] = useState("single");
+    const [singleRenderMode, setSingleRenderMode] = useState("lines");
+    const [showGraphNodes, setShowGraphNodes] = useState(false);
     const [deliveryStops, setDeliveryStops] = useState([]);
     const [k, setK] = useState(3);
     const [showNaiveRoute, setShowNaiveRoute] = useState(false);
     const [optimizedRouteData, setOptimizedRouteData] = useState(null);
+
+    // Comparison paths state
+    const [comparisonPaths, setComparisonPaths] = useState([]);
+
+    // Stepwise animation states
+    const [animationPhase, setAnimationPhase] = useState(0); // 0-3
+    const [phaseData, setPhaseData]     = useState(null);    // full stepwise result
+    const [clusterFrame, setClusterFrame] = useState(0);     // which K-Means iteration
+    const [clusteringDone, setClusteringDone] = useState(false);
+    const [currentZoneIdx, setCurrentZoneIdx] = useState(0); // which zone is animating in phase 2
+    const [zoneNNDone, setZoneNNDone]     = useState(false); // NN drawn, about to show 2-opt
+    const [zoneSwapIdx, setZoneSwapIdx]   = useState(0);     // which 2-opt swap
+    const [substepStatus, setSubstepStatus] = useState("idle"); // "idle" | "animating" | "completed"
 
     const ui = useRef();
     const fadeRadius = useRef();
@@ -66,6 +81,8 @@ function Map() {
     const state = useRef(new PathfindingState());
     const traceNode = useRef(null);
     const traceNode2 = useRef(null);
+    const clusterFrameTimer = useRef(null);
+    const stepwisePhase = useRef(0);
     const selectionRadiusOpacity = useSmoothStateChange(0, 0, 1, 400, fadeRadius.current, fadeRadiusReverse);
 
     async function mapClick(e, info, radius = null) {
@@ -140,12 +157,12 @@ function Map() {
                 fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${realNode.latitude}&lon=${realNode.longitude}`, {
                     headers: { "User-Agent": "Map-Pathfinding-Visualizer-CTSP" }
                 })
-                .then(r => r.json())
-                .then(data => {
-                    const name = data.display_name ? data.display_name.split(",").slice(0, 3).join(",") : newStop.address;
-                    setDeliveryStops(prev => prev.map(s => s.id === realNode.id ? { ...s, address: name } : s));
-                })
-                .catch(() => {});
+                    .then(r => r.json())
+                    .then(data => {
+                        const name = data.display_name ? data.display_name.split(",").slice(0, 3).join(",") : newStop.address;
+                        setDeliveryStops(prev => prev.map(s => s.id === realNode.id ? { ...s, address: name } : s));
+                    })
+                    .catch(() => {});
             }
             return;
         }
@@ -216,38 +233,130 @@ function Map() {
     function startClusteredAnimation() {
         if (!startNode || deliveryStops.length === 0) return;
 
-        const data = solveClusteredTsp(
-            { id: startNode.id, lat: startNode.lat, lon: startNode.lon },
-            deliveryStops,
-            k,
-            state.current.graph
-        );
+        const depot = { id: startNode.id, lat: startNode.lat, lon: startNode.lon };
+        const result = solveClusteredTspStepwise(depot, deliveryStops, k, state.current.graph, settings.algorithm);
 
-        if (!data) {
+        if (!result) {
             ui.current.showSnack("Failed to solve Clustered TSP routing.");
             return;
         }
 
-        setOptimizedRouteData(data);
+        setPhaseData(result);
+        setOptimizedRouteData(result.finalResult);
+        setAnimationPhase(0);
+        setClusterFrame(0);
+        setClusteringDone(false);
+        setCurrentZoneIdx(0);
+        setZoneNNDone(false);
+        setZoneSwapIdx(0);
+        stepwisePhase.current = 0;
+        setStarted(true);
+        setSubstepStatus("animating");
+
+        // Phase 1: animate K-Means frames with a timer
+        animateClusteringPhase(result.phases[0], 0);
+    }
+
+    function animateClusteringPhase(clusteringPhase, startFrame = 0) {
+        const frames = clusteringPhase.frames;
+        let frameIdx = startFrame;
+        setClusterFrame(frameIdx);
+
+        // Clear any old timer
+        if (clusterFrameTimer.current) clearInterval(clusterFrameTimer.current);
+
+        clusterFrameTimer.current = setInterval(() => {
+            frameIdx++;
+            setClusterFrame(frameIdx);
+            if (frameIdx >= frames.length - 1) {
+                clearInterval(clusterFrameTimer.current);
+                setClusteringDone(true);
+                setSubstepStatus("completed");
+                setStarted(false);
+            }
+        }, 600); // 600ms per K-Means iteration frame
+    }
+
+    function advanceToPhase(phaseIdx) {
+        // Clear any clustering timers
+        if (clusterFrameTimer.current) clearInterval(clusterFrameTimer.current);
+
+        stepwisePhase.current = phaseIdx;
+        setAnimationPhase(phaseIdx);
+
+        if (phaseIdx === 0) {
+            // Restart clustering phase
+            setClusterFrame(0);
+            setClusteringDone(false);
+            setStarted(true);
+            setSubstepStatus("animating");
+            if (phaseData) {
+                animateClusteringPhase(phaseData.phases[0], 0);
+            }
+        }
+        else if (phaseIdx === 1) {
+            // Phase 2: intrazone — start animating zone 0
+            setCurrentZoneIdx(0);
+            setZoneNNDone(false);
+            setZoneSwapIdx(0);
+            animateIntrazonePhase(0);
+        }
+        else if (phaseIdx === 2) {
+            // Phase 3: zone linking — build waypoints and play
+            if (!phaseData) return;
+            buildLinkingAnimation(phaseData.phases[2]);
+        }
+        else if (phaseIdx === 3) {
+            // Phase 4: summary
+            setStarted(false);
+            setAnimationEnded(true);
+            setSubstepStatus("completed");
+            buildSummaryRoute();
+        }
+    }
+
+    function animateIntrazonePhase(zoneIdx) {
+        if (!phaseData) return;
+        const zones = phaseData.phases[1].zones;
+        if (zoneIdx >= zones.length) {
+            advanceToPhase(2);
+            return;
+        }
+
+        const zone = zones[zoneIdx];
+        setCurrentZoneIdx(zoneIdx);
+        setZoneNNDone(false);
+        setZoneSwapIdx(0);
+
+        // Build and play NN segments for this zone
+        buildIntrazoneAnimation(zone.nnSegments, zone.color);
+    }
+
+    function buildIntrazoneAnimation(segments, color) {
+        // CRITICAL: reset timestamp reference so first frame doesn't get giant deltaTime
+        previousTimeRef.current = null;
 
         let currentTimer = 0;
         const pathWaypoints = [];
 
-        for (const segment of data.optimizedRoute) {
-            const segmentType = segment.type; // "connector" or "zone-0", "zone-1", etc.
-
-            for (let i = 0; i < segment.path.length - 1; i++) {
-                const node = segment.path[i];
-                const nextNode = segment.path[i + 1];
-                const distance = Math.hypot(nextNode.longitude - node.longitude, nextNode.latitude - node.latitude);
+        for (const seg of segments) {
+            const path = seg.path || seg;
+            for (let i = 0; i < path.length - 1; i++) {
+                const node = path[i];
+                const nextNode = path[i + 1];
+                const distance = Math.hypot(
+                    (nextNode.longitude ?? nextNode.lon) - (node.longitude ?? node.lon),
+                    (nextNode.latitude  ?? nextNode.lat) - (node.latitude  ?? node.lat)
+                );
                 const timeAdd = distance * 50000;
-
                 pathWaypoints.push({
-                    path: [[node.longitude ?? node.lon, node.latitude ?? node.lat], [nextNode.longitude ?? nextNode.lon, nextNode.latitude ?? nextNode.lat]],
+                    path: [
+                        [node.longitude ?? node.lon, node.latitude ?? node.lat],
+                        [nextNode.longitude ?? nextNode.lon, nextNode.latitude ?? nextNode.lat]
+                    ],
                     timestamps: [currentTimer, currentTimer + timeAdd],
-                    color: segmentType
+                    color: color
                 });
-
                 currentTimer += timeAdd;
             }
         }
@@ -255,11 +364,191 @@ function Map() {
         waypoints.current = pathWaypoints;
         timer.current = currentTimer;
         setTripsData(pathWaypoints);
+
+        // If there are no segments (e.g. single-stop zone), instantly complete
+        if (currentTimer === 0 || pathWaypoints.length === 0) {
+            setTime(0);
+            setAnimationEnded(true);
+            setStarted(false);
+            setSubstepStatus("completed");
+            return;
+        }
+
+        setSubstepStatus("animating");
+        setTime(0);
+        setAnimationEnded(false);
         setStarted(true);
     }
 
-    // Start or pause already running animation
+    function buildLinkingAnimation(linkingPhase) {
+        // CRITICAL: reset timestamp reference so first frame doesn't get giant deltaTime
+        previousTimeRef.current = null;
+
+        let currentTimer = 0;
+        const pathWaypoints = [];
+
+        for (const seg of linkingPhase.segments) {
+            // Determine color: connector = grey, zone-N = zone palette color
+            const segColor = seg.type === 'connector' || seg.type === 'return'
+                ? 'connector'
+                : seg.type; // 'zone-0', 'zone-1', etc.
+
+            for (let i = 0; i < seg.path.length - 1; i++) {
+                const node = seg.path[i];
+                const nextNode = seg.path[i + 1];
+                const distance = Math.hypot(
+                    (nextNode.longitude ?? nextNode.lon) - (node.longitude ?? node.lon),
+                    (nextNode.latitude  ?? nextNode.lat) - (node.latitude  ?? node.lat)
+                );
+                const timeAdd = distance * 50000;
+                pathWaypoints.push({
+                    path: [
+                        [node.longitude ?? node.lon, node.latitude ?? node.lat],
+                        [nextNode.longitude ?? nextNode.lon, nextNode.latitude ?? nextNode.lat]
+                    ],
+                    timestamps: [currentTimer, currentTimer + timeAdd],
+                    color: segColor
+                });
+                currentTimer += timeAdd;
+            }
+        }
+
+        waypoints.current = pathWaypoints;
+        timer.current = currentTimer;
+        setTripsData(pathWaypoints);
+        setSubstepStatus("animating");
+        setTime(0);
+        setAnimationEnded(false);
+        setStarted(true);
+    }
+
+    function buildSummaryRoute() {
+        if (!phaseData || !phaseData.finalResult) return;
+        const finalResult = phaseData.finalResult;
+        const pathWaypoints = [];
+
+        for (const seg of finalResult.optimizedRoute) {
+            for (let i = 0; i < seg.path.length - 1; i++) {
+                const node = seg.path[i];
+                const nextNode = seg.path[i + 1];
+                
+                let colorStr = "path";
+                if (seg.type === "connector") {
+                    colorStr = "connector";
+                } else if (seg.type.startsWith("zone-")) {
+                    colorStr = seg.type;
+                }
+
+                pathWaypoints.push({
+                    path: [
+                        [node.longitude ?? node.lon, node.latitude ?? node.lat],
+                        [nextNode.longitude ?? nextNode.lon, nextNode.latitude ?? nextNode.lat]
+                    ],
+                    timestamps: [0, 1e9],
+                    color: colorStr
+                });
+            }
+        }
+
+        waypoints.current = pathWaypoints;
+        timer.current = 1e9;
+        setTime(1e9);
+        setTripsData(pathWaypoints);
+    }
+
+    function runNextSubstep() {
+        if (!phaseData) return;
+
+        if (animationPhase === 0 && clusteringDone) {
+            // Move to Phase 2, Zone 0 Nearest Neighbor
+            setAnimationPhase(1);
+            stepwisePhase.current = 1;
+            setCurrentZoneIdx(0);
+            setZoneNNDone(false);
+            setZoneSwapIdx(0);
+            
+            const zone = phaseData.phases[1].zones[0];
+            buildIntrazoneAnimation(zone.nnSegments, zone.color);
+            return;
+        }
+
+        if (animationPhase === 1) {
+            const zones = phaseData.phases[1].zones;
+            const zone = zones[currentZoneIdx];
+
+            if (!zoneNNDone) {
+                if (zone.twoOptSwaps.length > 0) {
+                    // Mark NN done, move to 2-opt swap 0
+                    setZoneNNDone(true);
+                    setZoneSwapIdx(0);
+                    buildIntrazoneAnimation(zone.twoOptSwaps[0].segments, zone.color);
+                } else {
+                    // No 2-opt swaps for this zone → go to next zone
+                    _moveToNextZoneOrLinking(currentZoneIdx + 1);
+                }
+            } else {
+                const nextSwapIdx = zoneSwapIdx + 1;
+                if (nextSwapIdx < zone.twoOptSwaps.length) {
+                    setZoneSwapIdx(nextSwapIdx);
+                    buildIntrazoneAnimation(zone.twoOptSwaps[nextSwapIdx].segments, zone.color);
+                } else {
+                    // All 2-opt swaps done → go to next zone
+                    _moveToNextZoneOrLinking(currentZoneIdx + 1);
+                }
+            }
+            return;
+        }
+
+        if (animationPhase === 2) {
+            // Move to Phase 4 (Summary)
+            setAnimationPhase(3);
+            stepwisePhase.current = 3;
+            setStarted(false);
+            setAnimationEnded(true);
+            setSubstepStatus("completed");
+            buildSummaryRoute();
+            return;
+        }
+    }
+
+    function _moveToNextZoneOrLinking(nextZoneIdx) {
+        const zones = phaseData.phases[1].zones;
+        if (nextZoneIdx < zones.length) {
+            setCurrentZoneIdx(nextZoneIdx);
+            setZoneNNDone(false);
+            setZoneSwapIdx(0);
+            
+            const nextZone = zones[nextZoneIdx];
+            buildIntrazoneAnimation(nextZone.nnSegments, nextZone.color);
+        } else {
+            setAnimationPhase(2);
+            stepwisePhase.current = 2;
+            buildLinkingAnimation(phaseData.phases[2]);
+        }
+    }
+
     function toggleAnimation(loop = true, direction = 1) {
+        if (routingMode === "clustered") {
+            if (animationPhase === 0) {
+                if (started) {
+                    setStarted(false);
+                    if (clusterFrameTimer.current) clearInterval(clusterFrameTimer.current);
+                } else {
+                    setStarted(true);
+                    if (phaseData) {
+                        const currentFrame = clusterFrame >= phaseData.phases[0].frames.length - 1 ? 0 : clusterFrame;
+                        animateClusteringPhase(phaseData.phases[0], currentFrame);
+                    }
+                }
+            } else {
+                setStarted(!started);
+                if (!started) {
+                    previousTimeRef.current = null;
+                }
+            }
+            return;
+        }
+
         if(time === 0 && !animationEnded) return;
         setPlaybackDirection(direction);
         if(animationEnded) {
@@ -287,6 +576,16 @@ function Map() {
         traceNode.current = null;
         traceNode2.current = null;
         setAnimationEnded(false);
+        setAnimationPhase(0);
+        setPhaseData(null);
+        setClusterFrame(0);
+        setClusteringDone(false);
+        setCurrentZoneIdx(0);
+        setZoneNNDone(false);
+        setZoneSwapIdx(0);
+        setSubstepStatus("idle");
+        setComparisonPaths([]); // clear comparison paths
+        if (clusterFrameTimer.current) clearInterval(clusterFrameTimer.current);
     }
 
     // Progress animation by one step
@@ -298,8 +597,10 @@ function Map() {
                 setTime(prevTime => {
                     const nextTime = prevTime + timeStep;
                     if (nextTime >= timer.current && playbackDirection !== -1) {
+                        // Mark animation done and set substepStatus=completed in one batch
                         setAnimationEnded(true);
                         setStarted(false);
+                        setSubstepStatus("completed");
                         return timer.current;
                     }
                     return Math.max(0, nextTime);
@@ -391,10 +692,6 @@ function Map() {
         setTripsData(() => waypoints.current);
     }
 
-    function changeLocation(location) {
-        setViewState({ ...viewState, longitude: location.longitude, latitude: location.latitude, zoom: 13,transitionDuration: 1, transitionInterpolator: new FlyToInterpolator()});
-    }
-
     function changeSettings(newSettings) {
         setSettings(newSettings);
         const items = { settings: newSettings, colors };
@@ -436,6 +733,18 @@ function Map() {
         clearPath();
         setViewState({ ...viewState, longitude: location.longitude, latitude: location.latitude, zoom: 13,transitionDuration: 1, transitionInterpolator: new FlyToInterpolator()});
     }
+
+    useEffect(() => {
+        // Only auto-compute optimizedRouteData when NOT in an active stepwise animation
+        // (phaseData being set means animation is running — skip to avoid extra cluster renders)
+        if (routingMode === "clustered" && startNode && deliveryStops.length > 0 && state.current.graph && !phaseData) {
+            const depot = { id: startNode.id, lat: startNode.lat, lon: startNode.lon };
+            const data = solveClusteredTsp(depot, deliveryStops, k, state.current.graph, settings.algorithm);
+            setOptimizedRouteData(data);
+        } else if (!phaseData) {
+            setOptimizedRouteData(null);
+        }
+    }, [routingMode, startNode, deliveryStops, k, state.current.graph, phaseData]);
 
     useEffect(() => {
         if(!started) return;
@@ -492,34 +801,66 @@ function Map() {
                             widthMinPixels={2}
                         />
                     )}
-                    <TripsLayer
-                        id={"pathfinding-layer"}
-                        data={tripsData}
-                        opacity={1}
-                        widthMinPixels={4}
-                        widthMaxPixels={6}
-                        fadeTrail={false}
-                        currentTime={time}
-                        getColor={d => {
-                            const ZONE_COLORS = {
-                                "zone-0": [0, 150, 136],
-                                "zone-1": [255, 111, 0],
-                                "zone-2": [255, 193, 7],
-                                "zone-3": [156, 39, 176],
-                                "zone-4": [233, 30, 99],
-                                "zone-5": [76, 175, 80],
-                                "zone-6": [33, 150, 243],
-                                "zone-7": [255, 87, 34]
-                            };
-                            const CONNECTOR_COLOR = [224, 224, 224];
-                            if (d.color === "connector") return CONNECTOR_COLOR;
-                            if (d.color && d.color.startsWith("zone-")) return ZONE_COLORS[d.color] || [255, 255, 255];
-                            return colors[d.color] || colors.path;
-                        }}
-                        updateTriggers={{
-                            getColor: [colors.path, colors.route]
-                        }}
-                    />
+                    {routingMode === "single" && singleRenderMode === "points" ? (
+                        <ScatterplotLayer
+                            id={"pathfinding-points-layer"}
+                            data={tripsData.filter(d => d.timestamps[1] <= time)}
+                            getPosition={d => d.path[1]}
+                            getFillColor={d => {
+                                const ZONE_COLORS = {
+                                    "zone-0": [0, 150, 136],
+                                    "zone-1": [255, 111, 0],
+                                    "zone-2": [255, 193, 7],
+                                    "zone-3": [156, 39, 176],
+                                    "zone-4": [233, 30, 99],
+                                    "zone-5": [76, 175, 80],
+                                    "zone-6": [33, 150, 243],
+                                    "zone-7": [255, 87, 34]
+                                };
+                                const CONNECTOR_COLOR = [224, 224, 224];
+                                if (Array.isArray(d.color)) return d.color;
+                                if (d.color === "connector") return CONNECTOR_COLOR;
+                                if (typeof d.color === "string" && d.color.startsWith("zone-")) return ZONE_COLORS[d.color] || [255, 255, 255];
+                                return colors[d.color] || colors.path;
+                            }}
+                            radiusMinPixels={4}
+                            radiusMaxPixels={6}
+                            opacity={1}
+                            updateTriggers={{
+                                getFillColor: [colors.path, colors.route]
+                            }}
+                        />
+                    ) : (
+                        <TripsLayer
+                            id={"pathfinding-layer"}
+                            data={tripsData}
+                            opacity={1}
+                            widthMinPixels={4}
+                            widthMaxPixels={6}
+                            fadeTrail={false}
+                            currentTime={time}
+                            getColor={d => {
+                                const ZONE_COLORS = {
+                                    "zone-0": [0, 150, 136],
+                                    "zone-1": [255, 111, 0],
+                                    "zone-2": [255, 193, 7],
+                                    "zone-3": [156, 39, 176],
+                                    "zone-4": [233, 30, 99],
+                                    "zone-5": [76, 175, 80],
+                                    "zone-6": [33, 150, 243],
+                                    "zone-7": [255, 87, 34]
+                                };
+                                const CONNECTOR_COLOR = [224, 224, 224];
+                                if (Array.isArray(d.color)) return d.color;
+                                if (d.color === "connector") return CONNECTOR_COLOR;
+                                if (typeof d.color === "string" && d.color.startsWith("zone-")) return ZONE_COLORS[d.color] || [255, 255, 255];
+                                return colors[d.color] || colors.path;
+                            }}
+                            updateTriggers={{
+                                getColor: [colors.path, colors.route]
+                            }}
+                        />
+                    )}
                     {routingMode === "clustered" ? (
                         <>
                             {/* Depot Point */}
@@ -546,22 +887,29 @@ function Map() {
                                 id="delivery-stops"
                                 data={deliveryStops.map((stop, idx) => {
                                     const ZONE_COLORS = {
-                                        "zone-0": [0, 150, 136],
-                                        "zone-1": [255, 111, 0],
-                                        "zone-2": [255, 193, 7],
-                                        "zone-3": [156, 39, 176],
-                                        "zone-4": [233, 30, 99],
-                                        "zone-5": [76, 175, 80],
-                                        "zone-6": [33, 150, 243],
-                                        "zone-7": [255, 87, 34]
+                                        0: [0, 150, 136], 1: [255, 111, 0], 2: [255, 193, 7],
+                                        3: [156, 39, 176], 4: [233, 30, 99], 5: [76, 175, 80],
+                                        6: [33, 150, 243], 7: [255, 87, 34]
                                     };
-                                    let color = [64, 196, 255];
-                                    if (optimizedRouteData && stop.clusterId !== undefined) {
-                                        color = ZONE_COLORS[`zone-${stop.clusterId}`] || color;
+                                    let color = [100, 100, 120]; // unassigned gray
+                                    
+                                    if (animationPhase === 0 && phaseData) {
+                                        // Use live clustering frame assignment
+                                        const frame = phaseData.phases[0].frames[Math.min(clusterFrame, phaseData.phases[0].frames.length - 1)];
+                                        const assignedCluster = frame?.assignments?.[idx];
+                                        if (assignedCluster !== undefined && assignedCluster !== -1) {
+                                            color = ZONE_COLORS[assignedCluster] || color;
+                                        }
+                                    } else if (optimizedRouteData) {
+                                        const assignedCluster = optimizedRouteData.stops?.[idx]?.clusterId;
+                                        if (assignedCluster !== undefined && assignedCluster !== -1) {
+                                            color = ZONE_COLORS[assignedCluster] || color;
+                                        }
                                     }
+                                    
                                     return {
                                         coordinates: [stop.lon, stop.lat],
-                                        color: color,
+                                        color,
                                         lineColor: [255, 255, 255]
                                     };
                                 })}
@@ -577,7 +925,29 @@ function Map() {
                                 getPosition={d => d.coordinates}
                                 getFillColor={d => d.color}
                                 getLineColor={d => d.lineColor}
+                                updateTriggers={{ getFillColor: [clusterFrame, animationPhase, optimizedRouteData] }}
                             />
+                            {/* Show K-Means centroids during Phase 1 */}
+                            {animationPhase === 0 && phaseData && (() => {
+                                const frame = phaseData.phases[0].frames[Math.min(clusterFrame, phaseData.phases[0].frames.length - 1)];
+                                return frame?.centroids?.length > 0 ? (
+                                    <ScatterplotLayer
+                                        id="kmeans-centroids"
+                                        data={frame.centroids.map((c, idx) => ({
+                                            coordinates: [c.lon, c.lat],
+                                            color: [255, 255, 255, 200]
+                                        }))}
+                                        radiusMinPixels={10}
+                                        radiusMaxPixels={20}
+                                        stroked={true}
+                                        lineWidthMinPixels={2}
+                                        getPosition={d => d.coordinates}
+                                        getFillColor={[255, 255, 255, 40]}
+                                        getLineColor={[255, 255, 255, 220]}
+                                        updateTriggers={{ getPosition: [clusterFrame] }}
+                                    />
+                                ) : null;
+                            })()}
                             {/* Text Labels */}
                             <TextLayer
                                 id="stop-labels"
@@ -585,11 +955,31 @@ function Map() {
                                     ...(startNode ? [{ coordinates: [startNode.lon, startNode.lat], text: "DEPOT", color: [255, 255, 255] }] : []),
                                     ...deliveryStops.map((stop, idx) => {
                                         let label = `D${idx + 1}`;
-                                        if (optimizedRouteData && stop.clusterId !== undefined) {
+                                        
+                                        let assignedCluster = undefined;
+                                        if (animationPhase === 0 && phaseData) {
+                                            const frame = phaseData.phases[0].frames[Math.min(clusterFrame, phaseData.phases[0].frames.length - 1)];
+                                            assignedCluster = frame?.assignments?.[idx];
+                                        } else if (optimizedRouteData) {
+                                            assignedCluster = optimizedRouteData.stops?.[idx]?.clusterId;
+                                        }
+
+                                        if (assignedCluster !== undefined && assignedCluster !== -1) {
                                             const zoneLetters = ["A", "B", "C", "D", "E", "F", "G", "H"];
-                                            const letter = zoneLetters[stop.clusterId] || `${stop.clusterId}`;
-                                            const cluster = optimizedRouteData.clusters.find(c => c.id === stop.clusterId);
-                                            const stopSubIdx = cluster ? cluster.stops.findIndex(s => s.id === stop.id) + 1 : idx + 1;
+                                            const letter = zoneLetters[assignedCluster] || `${assignedCluster}`;
+                                            
+                                            let stopSubIdx = 1;
+                                            if (animationPhase === 0 && phaseData) {
+                                                const frame = phaseData.phases[0].frames[Math.min(clusterFrame, phaseData.phases[0].frames.length - 1)];
+                                                let subCount = 0;
+                                                for (let i = 0; i <= idx; i++) {
+                                                    if (frame?.assignments?.[i] === assignedCluster) subCount++;
+                                                }
+                                                stopSubIdx = subCount;
+                                            } else if (optimizedRouteData) {
+                                                const cluster = optimizedRouteData.clusters.find(c => c.id === assignedCluster);
+                                                stopSubIdx = cluster ? cluster.stops.findIndex(s => s.id === stop.id) + 1 : idx + 1;
+                                            }
                                             label = `D${idx + 1} (${letter}${stopSubIdx})`;
                                         }
                                         return {
@@ -606,6 +996,7 @@ function Map() {
                                 getTextAnchor="middle"
                                 getAlignmentBaseline="bottom"
                                 pixelOffset={[0, -12]}
+                                updateTriggers={{ getText: [clusterFrame, animationPhase, optimizedRouteData] }}
                             />
                         </>
                     ) : (
@@ -627,6 +1018,46 @@ function Map() {
                             getPosition={d => d.coordinates}
                             getFillColor={d => d.color}
                             getLineColor={d => d.lineColor}
+                        />
+                    )}
+                    {showGraphNodes && state.current?.graph?.nodes && (
+                        <ScatterplotLayer
+                            id="all-graph-nodes"
+                            data={Array.from(state.current.graph.nodes.values())}
+                            getPosition={d => [d.longitude, d.latitude]}
+                            getFillColor={[50, 200, 200, 120]}
+                            radiusMinPixels={2}
+                            radiusMaxPixels={4}
+                            pickable={false}
+                        />
+                    )}
+                    {comparisonPaths && comparisonPaths.length > 0 && (
+                        <PathLayer
+                            id="comparison-paths"
+                            data={comparisonPaths}
+                            pickable={true}
+                            widthScale={1}
+                            widthMinPixels={3}
+                            widthMaxPixels={10}
+                            getPath={d => d.path}
+                            getColor={d => {
+                                const COMPARISON_COLORS = {
+                                    "astar": [255, 60, 60, 200],
+                                    "dijkstra": [60, 150, 255, 200],
+                                    "greedy": [60, 255, 100, 200],
+                                    "bidirectional": [200, 60, 255, 200]
+                                };
+                                return COMPARISON_COLORS[d.name] || [255, 255, 255, 200];
+                            }}
+                            getWidth={d => {
+                                const COMPARISON_WIDTHS = {
+                                    "astar": 8,
+                                    "dijkstra": 6,
+                                    "greedy": 4,
+                                    "bidirectional": 10
+                                };
+                                return COMPARISON_WIDTHS[d.name] || 4;
+                            }}
                         />
                     )}
                     <MapGL 
@@ -665,6 +1096,10 @@ function Map() {
 
                 routingMode={routingMode}
                 setRoutingMode={setRoutingMode}
+                singleRenderMode={singleRenderMode}
+                setSingleRenderMode={setSingleRenderMode}
+                showGraphNodes={showGraphNodes}
+                setShowGraphNodes={setShowGraphNodes}
                 deliveryStops={deliveryStops}
                 setDeliveryStops={setDeliveryStops}
                 k={k}
@@ -673,12 +1108,21 @@ function Map() {
                 setShowNaiveRoute={setShowNaiveRoute}
                 optimizedRouteData={optimizedRouteData}
                 setOptimizedRouteData={setOptimizedRouteData}
-                solveClusteredTsp={(depot, stops, zones, graph) => {
-                    const data = solveClusteredTsp(depot, stops, zones, graph);
-                    setOptimizedRouteData(data);
-                    return data;
-                }}
                 graph={state.current.graph}
+                startNodeObj={state.current.startNode}
+                endNodeObj={state.current.endNode}
+                setComparisonPaths={setComparisonPaths}
+
+                animationPhase={animationPhase}
+                phaseData={phaseData}
+                clusterFrame={clusterFrame}
+                clusteringDone={clusteringDone}
+                currentZoneIdx={currentZoneIdx}
+                zoneNNDone={zoneNNDone}
+                zoneSwapIdx={zoneSwapIdx}
+                advanceToPhase={advanceToPhase}
+                substepStatus={substepStatus}
+                runNextSubstep={runNextSubstep}
             />
             <div className="attrib-container"><summary className="maplibregl-ctrl-attrib-button" title="Toggle attribution" aria-label="Toggle attribution"></summary><div className="maplibregl-ctrl-attrib-inner">© <a href="https://carto.com/about-carto/" target="_blank" rel="noopener">CARTO</a>, © <a href="http://www.openstreetmap.org/about/" target="_blank">OpenStreetMap</a> contributors</div></div>
         </>

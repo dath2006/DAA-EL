@@ -16,74 +16,95 @@ function getDistanceInDegrees(n1, n2) {
     return Math.hypot(n1.latitude - n2.latitude, n1.longitude - n2.longitude);
 }
 
+import AStar from "../models/algorithms/AStar";
+import BidirectionalSearch from "../models/algorithms/BidirectionalSearch";
+import Dijkstra from "../models/algorithms/Dijkstra";
+import Greedy from "../models/algorithms/Greedy";
+
 /**
- * Synchronous A* pathfinder on the loaded local graph.
+ * Synchronous pathfinder on the loaded local graph.
  * Find shortest path between two nodes in terms of graph edge weights.
  */
-export function findShortestPathSync(startNode, endNode, graph) {
+export function findShortestPathSync(startNode, endNode, graph, algorithmName = "astar") {
     if (!startNode || !endNode || !graph) return null;
     if (startNode.id === endNode.id) return { distance: 0, path: [startNode] };
 
     // Reset nodes
-    for (const node of graph.nodes.values()) {
-        node.visited = false;
-        node.distanceFromStart = Infinity;
-        node.parent = null;
+    for (const key of graph.nodes.keys()) {
+        graph.nodes.get(key).reset();
     }
 
-    startNode.distanceFromStart = 0;
-    const openSet = [startNode];
-    const openSetIds = new Set([startNode.id]);
+    let algo;
+    switch (algorithmName) {
+        case "astar": algo = new AStar(); break;
+        case "dijkstra": algo = new Dijkstra(); break;
+        case "greedy": algo = new Greedy(); break;
+        case "bidirectional": algo = new BidirectionalSearch(); break;
+        default: algo = new AStar(); break;
+    }
 
-    while (openSet.length > 0) {
-        // Find node with lowest f-score
-        let currentIdx = 0;
-        let currentF = openSet[0].distanceFromStart + getDistanceInDegrees(openSet[0], endNode);
-        for (let i = 1; i < openSet.length; i++) {
-            const f = openSet[i].distanceFromStart + getDistanceInDegrees(openSet[i], endNode);
-            if (f < currentF) {
-                currentF = f;
-                currentIdx = i;
-            }
-        }
+    algo.start(startNode, endNode);
 
-        const current = openSet[currentIdx];
-        if (current.id === endNode.id) {
-            const path = [];
-            let temp = current;
-            while (temp) {
-                path.push(temp);
-                temp = temp.parent;
-            }
-            path.reverse();
+    let safetyCount = 0;
+    let finalPath = [];
+    while (!algo.finished && safetyCount < 500000) {
+        const updated = algo.nextStep();
+        safetyCount++;
+        
+        if (algo.finished) {
+            if (algorithmName !== "bidirectional") {
+                let temp = endNode;
+                while (temp) {
+                    finalPath.push(temp);
+                    temp = temp.parent;
+                }
+                finalPath.reverse();
+            } else {
+                let intersection = updated.length > 0 ? updated[updated.length - 1] : null;
+                if (intersection) {
+                    let pathA = [];
+                    let currA = intersection;
+                    while(currA) { pathA.push(currA); currA = currA.parent; }
 
-            // Calculate distance in km
-            let distanceInKm = 0;
-            for (let i = 0; i < path.length - 1; i++) {
-                distanceInKm += getDistanceInKm(path[i].latitude, path[i].longitude, path[i + 1].latitude, path[i + 1].longitude);
-            }
-            return { distance: distanceInKm, path };
-        }
+                    let pathB = [];
+                    let currB = intersection.prevParent;
+                    if (!currB && intersection.id !== startNode.id && intersection.id !== endNode.id) {
+                        const otherNeighbor = intersection.neighbors.find(n => n.node.parent && n.node.parent.id !== pathA[1]?.id);
+                        if (otherNeighbor) currB = otherNeighbor.node;
+                    }
 
-        openSet.splice(currentIdx, 1);
-        openSetIds.delete(current.id);
-        current.visited = true;
+                    while(currB) { pathB.push(currB); currB = currB.parent; }
 
-        for (const edgeInfo of current.neighbors) {
-            const neighbor = edgeInfo.node;
-            if (neighbor.visited) continue;
+                    let pathA_reachesStart = pathA.length > 0 && pathA[pathA.length - 1].id === startNode.id;
+                    let pathB_reachesStart = pathB.length > 0 && pathB[pathB.length - 1].id === startNode.id;
 
-            const tentativeG = current.distanceFromStart + edgeInfo.edge.weight;
-            if (tentativeG < neighbor.distanceFromStart) {
-                neighbor.parent = current;
-                neighbor.distanceFromStart = tentativeG;
-
-                if (!openSetIds.has(neighbor.id)) {
-                    openSet.push(neighbor);
-                    openSetIds.add(neighbor.id);
+                    if (pathA_reachesStart) {
+                        pathA.reverse();
+                        finalPath = [...pathA, ...pathB];
+                    } else if (pathB_reachesStart) {
+                        pathB.reverse();
+                        finalPath = [...pathB, ...pathA];
+                    } else {
+                        finalPath = pathA;
+                    }
                 }
             }
+            break;
         }
+    }
+
+    // Fallback if path finishes but no valid path was populated (e.g. unreachable)
+    if (finalPath.length > 0 && finalPath[finalPath.length - 1].id === endNode.id) {
+        let distanceInKm = 0;
+        for (let i = 0; i < finalPath.length - 1; i++) {
+            distanceInKm += getDistanceInKm(
+                finalPath[i].latitude ?? finalPath[i].lat, 
+                finalPath[i].longitude ?? finalPath[i].lon, 
+                finalPath[i + 1].latitude ?? finalPath[i + 1].lat, 
+                finalPath[i + 1].longitude ?? finalPath[i + 1].lon
+            );
+        }
+        return { distance: distanceInKm, path: finalPath };
     }
 
     return null; // Path not found
@@ -429,7 +450,7 @@ export function countCrossings(pathPoints) {
 /**
  * Full pipeline solver for Clustered TSP (CTSP)
  */
-export function solveClusteredTsp(depot, stops, k, graph) {
+export function solveClusteredTsp(depot, stops, k, graph, algorithmName = "astar") {
     if (!depot || stops.length === 0 || !graph) return null;
 
     // 1. Assign zones using K-Means
@@ -473,7 +494,7 @@ export function solveClusteredTsp(depot, stops, k, graph) {
 
         for (let i = 0; i < m; i++) {
             for (let j = i + 1; j < m; j++) {
-                const pathResult = findShortestPathSync(stopNodes[i], stopNodes[j], graph);
+                const pathResult = findShortestPathSync(stopNodes[i], stopNodes[j], graph, algorithmName);
                 if (pathResult) {
                     distMatrix[i][j] = pathResult.distance;
                     distMatrix[j][i] = pathResult.distance;
@@ -496,7 +517,8 @@ export function solveClusteredTsp(depot, stops, k, graph) {
             stops: tspTourIdxs.map(idx => clusterStops[idx]),
             nodes: tspTourIdxs.map(idx => stopNodes[idx]),
             distMatrix,
-            pathMatrix
+            pathMatrix,
+            tourOrder: tspTourIdxs
         });
     }
 
@@ -564,7 +586,7 @@ export function solveClusteredTsp(depot, stops, k, graph) {
         // Add connector from previous exit to entry of this zone
         const entryNode = tour.nodes[entryIdx];
         const entryCoord = tour.stops[entryIdx];
-        let connPath = findShortestPathSync(currentExitNode, entryNode, graph);
+        let connPath = findShortestPathSync(currentExitNode, entryNode, graph, algorithmName);
         
         finalOptimizedRoute.push({
             from: currentExitCoord,
@@ -578,8 +600,10 @@ export function solveClusteredTsp(depot, stops, k, graph) {
         for (let i = 0; i < m - 1; i++) {
             const idx1 = selectedTourIdxs[i];
             const idx2 = selectedTourIdxs[i + 1];
-            const stopPath = tour.pathMatrix[idx1][idx2] || [tour.nodes[idx1], tour.nodes[idx2]];
-            const stopDist = tour.distMatrix[idx1][idx2];
+            const origIdx1 = tour.tourOrder[idx1];
+            const origIdx2 = tour.tourOrder[idx2];
+            const stopPath = tour.pathMatrix[origIdx1][origIdx2] || [tour.nodes[idx1], tour.nodes[idx2]];
+            const stopDist = tour.distMatrix[origIdx1][origIdx2];
 
             finalOptimizedRoute.push({
                 from: tour.stops[idx1],
@@ -597,7 +621,7 @@ export function solveClusteredTsp(depot, stops, k, graph) {
     }
 
     // Connect last exit back to Depot
-    let returnPath = findShortestPathSync(currentExitNode, depotNode, graph);
+    let returnPath = findShortestPathSync(currentExitNode, depotNode, graph, algorithmName);
     finalOptimizedRoute.push({
         from: currentExitCoord,
         to: { lat: depot.lat, lon: depot.lon },
@@ -624,7 +648,7 @@ export function solveClusteredTsp(depot, stops, k, graph) {
             }
         }
 
-        const pathResult = findShortestPathSync(naiveCurrentNode, nextStopNode, graph);
+        const pathResult = findShortestPathSync(naiveCurrentNode, nextStopNode, graph, algorithmName);
         finalNaiveRoute.push({
             from: naiveCurrentCoord,
             to: nextStopCoord,
@@ -638,7 +662,7 @@ export function solveClusteredTsp(depot, stops, k, graph) {
     }
 
     // Connect last naive stop back to depot
-    const finalNaiveReturn = findShortestPathSync(naiveCurrentNode, depotNode, graph);
+    const finalNaiveReturn = findShortestPathSync(naiveCurrentNode, depotNode, graph, algorithmName);
     finalNaiveRoute.push({
         from: naiveCurrentCoord,
         to: { lat: depot.lat, lon: depot.lon },
@@ -690,5 +714,496 @@ export function solveClusteredTsp(depot, stops, k, graph) {
             optimizedCrossings: crossingsOptimized,
             crossingsSaved: crossingsSaved
         }
+    };
+}
+
+/**
+ * Cheapest Insertion Algorithm — O(n²)
+ * Inserts a new stop into an existing ordered route at the position
+ * that causes minimum increase in total route distance.
+ * Returns the new route segments in order.
+ */
+export function cheapestInsertion(newStop, existingTourStops) {
+    // existingTourStops: array of {id, lat, lon} including depot at [0] and end
+    const n = existingTourStops.length;
+    if (n < 2) return null;
+
+    let bestCost = Infinity;
+    let bestInsertAfter = 0; // insert after index i, before index i+1
+
+    for (let i = 0; i < n - 1; i++) {
+        const a = existingTourStops[i];
+        const b = existingTourStops[i + 1];
+        const dAB = getDistanceInKm(a.lat, a.lon, b.lat, b.lon);
+        const dAN = getDistanceInKm(a.lat, a.lon, newStop.lat, newStop.lon);
+        const dNB = getDistanceInKm(newStop.lat, newStop.lon, b.lat, b.lon);
+        const insertionCost = dAN + dNB - dAB;
+        if (insertionCost < bestCost) {
+            bestCost = insertionCost;
+            bestInsertAfter = i;
+        }
+    }
+
+    const newTour = [
+        ...existingTourStops.slice(0, bestInsertAfter + 1),
+        newStop,
+        ...existingTourStops.slice(bestInsertAfter + 1)
+    ];
+
+    return { newTour, insertedAfter: bestInsertAfter, insertionCost: bestCost };
+}
+
+/**
+ * Nearest Neighbor greedy TSP — O(n²), no refinement.
+ * Used for the face-off "naive" side.
+ */
+export function solveNaiveTsp(depot, stops, graph) {
+    if (!depot || stops.length === 0 || !graph) return null;
+
+    // Find depot node
+    let depotNode = null, minD = Infinity;
+    for (const node of graph.nodes.values()) {
+        const d = Math.pow(node.latitude - depot.lat, 2) + Math.pow(node.longitude - depot.lon, 2);
+        if (d < minD) { minD = d; depotNode = node; }
+    }
+
+    const route = [];
+    let currentNode = depotNode;
+    let currentCoord = { lat: depot.lat, lon: depot.lon };
+    const remaining = [...stops];
+
+    while (remaining.length > 0) {
+        // Find nearest unvisited stop
+        let nearest = null, nearestIdx = -1, nearestDist = Infinity;
+        for (let i = 0; i < remaining.length; i++) {
+            const d = getDistanceInKm(currentCoord.lat, currentCoord.lon, remaining[i].lat, remaining[i].lon);
+            if (d < nearestDist) { nearestDist = d; nearest = remaining[i]; nearestIdx = i; }
+        }
+
+        // Find node for nearest stop
+        let nearestNode = null, minN = Infinity;
+        for (const node of graph.nodes.values()) {
+            const d = Math.pow(node.latitude - nearest.lat, 2) + Math.pow(node.longitude - nearest.lon, 2);
+            if (d < minN) { minN = d; nearestNode = node; }
+        }
+
+        const pathResult = findShortestPathSync(currentNode, nearestNode, graph, algorithmName);
+        route.push({
+            from: currentCoord, to: nearest,
+            path: pathResult ? pathResult.path : [currentNode, nearestNode],
+            type: "naive-nn",
+            distance: pathResult ? pathResult.distance : getDistanceInKm(currentCoord.lat, currentCoord.lon, nearest.lat, nearest.lon)
+        });
+
+        currentNode = nearestNode;
+        currentCoord = nearest;
+        remaining.splice(nearestIdx, 1);
+    }
+
+    // Return to depot
+    const returnPath = findShortestPathSync(currentNode, depotNode, graph, algorithmName);
+    route.push({
+        from: currentCoord, to: { lat: depot.lat, lon: depot.lon },
+        path: returnPath ? returnPath.path : [currentNode, depotNode],
+        type: "naive-nn",
+        distance: returnPath ? returnPath.distance : getDistanceInKm(currentCoord.lat, currentCoord.lon, depot.lat, depot.lon)
+    });
+
+    const totalDist = route.reduce((s, r) => s + r.distance, 0);
+    return { route, totalDistance: totalDist };
+}
+
+/**
+ * Detects the elbow point in WCSS data using the "knee" method
+ * (maximum distance from the line connecting first and last point)
+ */
+export function findElbowK(elbowData) {
+    if (elbowData.length < 3) return elbowData[0]?.k ?? 1;
+
+    const first = elbowData[0];
+    const last = elbowData[elbowData.length - 1];
+
+    // Line from first to last
+    const dx = last.k - first.k;
+    const dy = last.wcss - first.wcss;
+
+    let maxDist = -Infinity;
+    let elbowK = first.k;
+
+    for (const point of elbowData) {
+        // Perpendicular distance from point to line
+        const dist = Math.abs(dy * point.k - dx * point.wcss + last.k * first.wcss - last.wcss * first.k)
+            / Math.sqrt(dy * dy + dx * dx);
+        if (dist > maxDist) {
+            maxDist = dist;
+            elbowK = point.k;
+        }
+    }
+
+    return elbowK;
+}
+
+/**
+ * Same pipeline as solveClusteredTsp but returns intermediate phases
+ * so the visualizer can animate each stage separately.
+ *
+ * Returns:
+ * {
+ *   phases: [
+ *     { type: 'clustering', frames: [{centroids, assignments}] },   // Phase 1
+ *     { type: 'intrazone',  zones: [{clusterId, segments, color}] }, // Phase 2
+ *     { type: 'linking',    segments: [{...connector paths}] },      // Phase 3
+ *     { type: 'summary',    stats }                                   // Phase 4
+ *   ],
+ *   finalResult: { ...same shape as solveClusteredTsp }
+ * }
+ */
+export function solveClusteredTspStepwise(depot, stops, k, graph, algorithmName = "astar") {
+    if (!depot || stops.length === 0 || !graph) return null;
+
+    // ── Phase 1: K-Means with captured frames ──────────────────────────────
+    const clusteringFrames = [];
+
+    const actualK = Math.max(1, Math.min(stops.length, k));
+    const centroids = [];
+    const firstIdx = Math.floor(Math.random() * stops.length);
+    centroids.push({ lat: stops[firstIdx].lat, lon: stops[firstIdx].lon });
+
+    for (let c = 1; c < actualK; c++) {
+        const distSq = stops.map(stop => {
+            let minDist = Infinity;
+            for (const centroid of centroids) {
+                const d = Math.pow(stop.lat - centroid.lat, 2) + Math.pow(stop.lon - centroid.lon, 2);
+                if (d < minDist) minDist = d;
+            }
+            return minDist;
+        });
+        const sumDist = distSq.reduce((s, d) => s + d, 0);
+        let r = Math.random() * sumDist, cumulative = 0;
+        let nextCentroid = stops[stops.length - 1];
+        for (let i = 0; i < stops.length; i++) {
+            cumulative += distSq[i];
+            if (r <= cumulative) { nextCentroid = stops[i]; break; }
+        }
+        centroids.push({ lat: nextCentroid.lat, lon: nextCentroid.lon });
+    }
+
+    let assignments = new Array(stops.length).fill(-1);
+    let converged = false, iterations = 0;
+
+    // Capture initial state
+    clusteringFrames.push({
+        centroids: centroids.map(c => ({ ...c })),
+        assignments: [...assignments]
+    });
+
+    while (!converged && iterations < 100) {
+        converged = true;
+        iterations++;
+
+        for (let i = 0; i < stops.length; i++) {
+            let minDist = Infinity, nearestIdx = -1;
+            for (let cIdx = 0; cIdx < actualK; cIdx++) {
+                const d = Math.pow(stops[i].lat - centroids[cIdx].lat, 2)
+                        + Math.pow(stops[i].lon - centroids[cIdx].lon, 2);
+                if (d < minDist) { minDist = d; nearestIdx = cIdx; }
+            }
+            if (assignments[i] !== nearestIdx) { assignments[i] = nearestIdx; converged = false; }
+        }
+
+        if (!converged) {
+            const sumCoords = Array.from({ length: actualK }, () => ({ sumLat: 0, sumLon: 0, count: 0 }));
+            for (let i = 0; i < stops.length; i++) {
+                sumCoords[assignments[i]].sumLat += stops[i].lat;
+                sumCoords[assignments[i]].sumLon += stops[i].lon;
+                sumCoords[assignments[i]].count++;
+            }
+            for (let cIdx = 0; cIdx < actualK; cIdx++) {
+                const sc = sumCoords[cIdx];
+                if (sc.count > 0) centroids[cIdx] = { lat: sc.sumLat / sc.count, lon: sc.sumLon / sc.count };
+            }
+        }
+
+        // Capture this iteration's state
+        clusteringFrames.push({
+            centroids: centroids.map(c => ({ ...c })),
+            assignments: [...assignments]
+        });
+    }
+
+    // Build cluster objects
+    const clusters = Array.from({ length: actualK }, (_, idx) => ({ id: idx, centroid: centroids[idx], stops: [] }));
+    for (let i = 0; i < stops.length; i++) {
+        if (assignments[i] !== -1) clusters[assignments[i]].stops.push({ ...stops[i], clusterId: assignments[i] });
+    }
+    const activeClusters = clusters.filter(c => c.stops.length > 0);
+
+    // ── Phase 2: Intra-zone TSP with step captures ─────────────────────────
+    const ZONE_COLORS = {
+        0: [0, 150, 136], 1: [255, 111, 0], 2: [255, 193, 7],
+        3: [156, 39, 176], 4: [233, 30, 99], 5: [76, 175, 80],
+        6: [33, 150, 243], 7: [255, 87, 34]
+    };
+
+    const clusterTours = [];
+    const intrazoneSegments = []; // { clusterId, color, steps: [{type:'nn'|'2opt', path}] }
+
+    for (const cluster of activeClusters) {
+        const m = cluster.stops.length;
+        const color = ZONE_COLORS[cluster.id] || [255, 255, 255];
+
+        // Map to graph nodes
+        const stopNodes = cluster.stops.map(stop => {
+            let nearestNode = null, minDist = Infinity;
+            for (const node of graph.nodes.values()) {
+                const d = Math.pow(node.latitude - stop.lat, 2) + Math.pow(node.longitude - stop.lon, 2);
+                if (d < minDist) { minDist = d; nearestNode = node; }
+            }
+            return nearestNode;
+        });
+
+        // Distance + path matrices
+        const distMatrix = Array.from({ length: m }, () => new Array(m).fill(0));
+        const pathMatrix = Array.from({ length: m }, () => new Array(m).fill(null));
+        for (let i = 0; i < m; i++) {
+            for (let j = i + 1; j < m; j++) {
+                const pathResult = findShortestPathSync(stopNodes[i], stopNodes[j], graph, algorithmName);
+                if (pathResult) {
+                    distMatrix[i][j] = pathResult.distance;
+                    distMatrix[j][i] = pathResult.distance;
+                    pathMatrix[i][j] = pathResult.path;
+                    pathMatrix[j][i] = [...pathResult.path].reverse();
+                } else {
+                    const d = getDistanceInKm(cluster.stops[i].lat, cluster.stops[i].lon, cluster.stops[j].lat, cluster.stops[j].lon);
+                    distMatrix[i][j] = distMatrix[j][i] = d;
+                }
+            }
+        }
+
+        // NN tour
+        const nnTour = [0];
+        const visited = new Set([0]);
+        let current = 0;
+        while (nnTour.length < m) {
+            let nextNode = -1, minDist = Infinity;
+            for (let i = 0; i < m; i++) {
+                if (!visited.has(i) && distMatrix[current][i] < minDist) {
+                    minDist = distMatrix[current][i]; nextNode = i;
+                }
+            }
+            nnTour.push(nextNode); visited.add(nextNode); current = nextNode;
+        }
+
+        // Build NN path segments for animation
+        const nnPathSegments = [];
+        for (let i = 0; i < m - 1; i++) {
+            const p = pathMatrix[nnTour[i]][nnTour[i + 1]] || [stopNodes[nnTour[i]], stopNodes[nnTour[i + 1]]];
+            nnPathSegments.push({ path: p, label: `NN: stop ${i + 1} → ${i + 2}` });
+        }
+        // Close loop
+        if (m > 1) {
+            const p = pathMatrix[nnTour[m - 1]][nnTour[0]] || [stopNodes[nnTour[m - 1]], stopNodes[nnTour[0]]];
+            nnPathSegments.push({ path: p, label: `NN: closing loop` });
+        }
+
+        // 2-opt improvements — capture each swap
+        const tour = [...nnTour];
+        const twoOptSwaps = [];
+        let improved = true;
+        let iteration = 0;
+        while (improved && iteration < 500) {
+            improved = false; iteration++;
+            for (let i = 1; i < m - 1; i++) {
+                for (let j = i + 1; j < m; j++) {
+                    const a = tour[i - 1], b = tour[i], c = tour[j], d = tour[(j + 1) % m];
+                    const oldDist = distMatrix[a][b] + distMatrix[c][d];
+                    const newDist = distMatrix[a][c] + distMatrix[b][d];
+                    if (newDist < oldDist - 1e-9) {
+                        reverseSubArray(tour, i, j);
+                        improved = true;
+                        // Capture the improved tour as a sequence of path segments
+                        const swapSegments = [];
+                        for (let k = 0; k < m - 1; k++) {
+                            const p = pathMatrix[tour[k]][tour[k + 1]] || [stopNodes[tour[k]], stopNodes[tour[k + 1]]];
+                            swapSegments.push({ path: p });
+                        }
+                        const closeP = pathMatrix[tour[m - 1]][tour[0]] || [stopNodes[tour[m - 1]], stopNodes[tour[0]]];
+                        swapSegments.push({ path: closeP });
+                        twoOptSwaps.push({ segments: swapSegments, improvement: oldDist - newDist });
+                    }
+                }
+            }
+        }
+
+        intrazoneSegments.push({
+            clusterId: cluster.id,
+            color,
+            stopCount: m,         // exact number of stops in this zone
+            nnSegments: nnPathSegments,
+            twoOptSwaps, // can be empty if no improvement found
+            finalTour: tour,
+            finalSegments: tour.map((idx, i) => {
+                const nextIdx = tour[(i + 1) % m];
+                return pathMatrix[idx][nextIdx] || [stopNodes[idx], stopNodes[nextIdx]];
+            })
+        });
+
+        clusterTours.push({ clusterId: cluster.id, stops: tour.map(i => cluster.stops[i]), nodes: tour.map(i => stopNodes[i]), distMatrix, pathMatrix, tourOrder: tour });
+    }
+
+    // ── Phase 3: Zone linking ──────────────────────────────────────────────
+    const sequencedClusters = sequenceZones(depot, activeClusters);
+    let depotNode = null, minDepotDist = Infinity;
+    for (const node of graph.nodes.values()) {
+        const d = Math.pow(node.latitude - depot.lat, 2) + Math.pow(node.longitude - depot.lon, 2);
+        if (d < minDepotDist) { minDepotDist = d; depotNode = node; }
+    }
+
+    const linkingSegments = [];
+    let currentExitNode = depotNode;
+    let currentExitCoord = { lat: depot.lat, lon: depot.lon };
+
+    for (let cIdx = 0; cIdx < sequencedClusters.length; cIdx++) {
+        const activeCluster = sequencedClusters[cIdx];
+        const tour = clusterTours.find(t => t.clusterId === activeCluster.id);
+        const m = tour.stops.length;
+
+        // Entry stop closest to current exit
+        let entryIdx = 0, minEntryDist = Infinity;
+        for (let i = 0; i < m; i++) {
+            const d = getDistanceInKm(currentExitCoord.lat, currentExitCoord.lon, tour.stops[i].lat, tour.stops[i].lon);
+            if (d < minEntryDist) { minEntryDist = d; entryIdx = i; }
+        }
+
+        // Determine traversal direction of the cluster's TSP cycle
+        const forwardTour = [];
+        for (let i = 0; i < m; i++) forwardTour.push((entryIdx + i) % m);
+        const backwardTour = [entryIdx];
+        for (let i = 1; i < m; i++) backwardTour.push((entryIdx - i + m) % m);
+
+        // Target next cluster centroid or depot
+        const nextTargetCoord = (cIdx < sequencedClusters.length - 1) 
+            ? sequencedClusters[cIdx + 1].centroid 
+            : { lat: depot.lat, lon: depot.lon };
+
+        const exitIdxForward = forwardTour[m - 1];
+        const exitIdxBackward = backwardTour[m - 1];
+
+        const distForward = getDistanceInKm(tour.stops[exitIdxForward].lat, tour.stops[exitIdxForward].lon, nextTargetCoord.lat, nextTargetCoord.lon);
+        const distBackward = getDistanceInKm(tour.stops[exitIdxBackward].lat, tour.stops[exitIdxBackward].lon, nextTargetCoord.lat, nextTargetCoord.lon);
+
+        const selectedTourIdxs = (distForward <= distBackward) ? forwardTour : backwardTour;
+
+        const entryNode = tour.nodes[entryIdx];
+        const connPath = findShortestPathSync(currentExitNode, entryNode, graph, algorithmName);
+        linkingSegments.push({
+            type: 'connector',
+            label: cIdx === 0 ? `Depot → Zone ${activeCluster.id}` : `Zone ${sequencedClusters[cIdx - 1].id} → Zone ${activeCluster.id}`,
+            path: connPath ? connPath.path : [currentExitNode, entryNode],
+            distance: connPath ? connPath.distance : getDistanceInKm(currentExitCoord.lat, currentExitCoord.lon, tour.stops[entryIdx].lat, tour.stops[entryIdx].lon),
+            fromZone: cIdx === 0 ? 'depot' : sequencedClusters[cIdx - 1].id,
+            toZone: activeCluster.id
+        });
+
+        // ── Traverse the zone's internal tour starting from entryIdx ──
+        for (let i = 0; i < m - 1; i++) {
+            const idx1 = selectedTourIdxs[i];
+            const idx2 = selectedTourIdxs[i + 1];
+            const origIdx1 = tour.tourOrder[idx1];
+            const origIdx2 = tour.tourOrder[idx2];
+            const segPath = tour.pathMatrix[origIdx1][origIdx2]
+                || [tour.nodes[idx1], tour.nodes[idx2]];
+            const segDist = tour.distMatrix[origIdx1][origIdx2];
+            linkingSegments.push({
+                type: `zone-${activeCluster.id}`,
+                label: `Zone ${activeCluster.id}: stop ${i + 1} → ${i + 2}`,
+                path: segPath,
+                distance: segDist,
+                zoneId: activeCluster.id
+            });
+        }
+
+        const lastTourIdx = selectedTourIdxs[m - 1];
+        currentExitNode = tour.nodes[lastTourIdx];
+        currentExitCoord = tour.stops[lastTourIdx];
+    }
+
+    // Return to depot
+    const returnPath = findShortestPathSync(currentExitNode, depotNode, graph, algorithmName);
+    linkingSegments.push({
+        type: 'return',
+        label: 'Return to depot',
+        path: returnPath ? returnPath.path : [currentExitNode, depotNode],
+        distance: returnPath ? returnPath.distance : getDistanceInKm(currentExitCoord.lat, currentExitCoord.lon, depot.lat, depot.lon),
+    });
+
+    // ── Compute Naive Route for Stats ────────────────
+    const finalNaiveRoute = [];
+    let naiveCurrentNode = depotNode;
+    let naiveCurrentCoord = { lat: depot.lat, lon: depot.lon };
+
+    for (let i = 0; i < stops.length; i++) {
+        const nextStopCoord = stops[i];
+        let nextStopNode = null, minStopDist = Infinity;
+        for (const node of graph.nodes.values()) {
+            const d = Math.pow(node.latitude - nextStopCoord.lat, 2) + Math.pow(node.longitude - nextStopCoord.lon, 2);
+            if (d < minStopDist) { minStopDist = d; nextStopNode = node; }
+        }
+
+        const pathResult = findShortestPathSync(naiveCurrentNode, nextStopNode, graph, algorithmName);
+        finalNaiveRoute.push({
+            path: pathResult ? pathResult.path : [naiveCurrentNode, nextStopNode],
+            distance: pathResult ? pathResult.distance : getDistanceInKm(naiveCurrentCoord.lat, naiveCurrentCoord.lon, nextStopCoord.lat, nextStopCoord.lon)
+        });
+        naiveCurrentNode = nextStopNode;
+        naiveCurrentCoord = nextStopCoord;
+    }
+    const finalNaiveReturn = findShortestPathSync(naiveCurrentNode, depotNode, graph, algorithmName);
+    finalNaiveRoute.push({
+        path: finalNaiveReturn ? finalNaiveReturn.path : [naiveCurrentNode, depotNode],
+        distance: finalNaiveReturn ? finalNaiveReturn.distance : getDistanceInKm(naiveCurrentCoord.lat, naiveCurrentCoord.lon, depot.lat, depot.lon)
+    });
+
+    const naiveDistance = finalNaiveRoute.reduce((sum, seg) => sum + seg.distance, 0);
+    const totalOptimizedDistance = linkingSegments.reduce((sum, seg) => sum + seg.distance, 0);
+
+    const optimizedPoints = [];
+    for (const seg of linkingSegments) {
+        for (const node of seg.path) {
+            optimizedPoints.push([node.longitude ?? node.lon, node.latitude ?? node.lat]);
+        }
+    }
+
+    const naivePoints = [];
+    for (const seg of finalNaiveRoute) {
+        for (const node of seg.path) {
+            naivePoints.push([node.longitude ?? node.lon, node.latitude ?? node.lat]);
+        }
+    }
+
+    const crossingsNaive = countCrossings(naivePoints);
+    const crossingsOptimized = countCrossings(optimizedPoints);
+
+    const finalResult = {
+        optimizedRoute: linkingSegments,
+        stats: {
+            naiveDistance: naiveDistance,
+            optimizedDistance: totalOptimizedDistance,
+            distanceSaved: Math.max(0, naiveDistance - totalOptimizedDistance),
+            percentageReduction: Math.max(0, ((naiveDistance - totalOptimizedDistance) / naiveDistance) * 100),
+            naiveCrossings: crossingsNaive,
+            optimizedCrossings: crossingsOptimized,
+            crossingsSaved: Math.max(0, crossingsNaive - crossingsOptimized)
+        }
+    };
+
+    return {
+        phases: [
+            { type: 'clustering', frames: clusteringFrames, stops, k: actualK },
+            { type: 'intrazone',  zones: intrazoneSegments },
+            { type: 'linking',    segments: linkingSegments },
+            { type: 'summary',    stats: finalResult?.stats ?? null }
+        ],
+        finalResult
     };
 }

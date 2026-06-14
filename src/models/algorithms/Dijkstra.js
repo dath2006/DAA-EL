@@ -18,7 +18,8 @@ class Dijkstra extends PathfindingAlgorithm {
         }
 
         const updatedNodes = [];
-        const currentNode = this.openList.shift();
+        const currentNode = this.openList.reduce((acc, current) => current.distanceFromStart < acc.distanceFromStart ? current : acc, this.openList[0]);
+        this.openList.splice(this.openList.indexOf(currentNode), 1);
         currentNode.visited = true;
         const refEdge = currentNode.edges.find(e => e.getOtherNode(currentNode) === currentNode.referer);
         if(refEdge) refEdge.visited = true;

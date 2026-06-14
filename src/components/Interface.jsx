@@ -5,15 +5,79 @@ import Slider from "./Slider";
 import { useState, useEffect, useRef, useImperativeHandle, forwardRef } from "react";
 import { INITIAL_COLORS, LOCATIONS } from "../config";
 import { arrayToRgb, rgbToArray } from "../helpers";
-import { getElbowData } from "../services/RoutingService";
+import { getElbowData, findElbowK } from "../services/RoutingService";
+import { runComparison } from "../services/ComparisonService";
+import { MdBarChart } from "react-icons/md";
 
-const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, time, maxTime, settings, colors, loading, timeChanged, cinematic, placeEnd, changeRadius, changeAlgorithm, setPlaceEnd, setCinematic, setSettings, setColors, startPathfinding, toggleAnimation, clearPath, changeLocation, mapStyle, changeMapStyle, routingMode, setRoutingMode, deliveryStops, setDeliveryStops, k, setK, showNaiveRoute, setShowNaiveRoute, optimizedRouteData, setOptimizedRouteData, solveClusteredTsp, graph }, ref) => {
+const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, time, maxTime, settings, colors, loading, timeChanged, cinematic, placeEnd, changeRadius, changeAlgorithm, setPlaceEnd, setCinematic, setSettings, setColors, startPathfinding, toggleAnimation, clearPath, changeLocation, mapStyle, changeMapStyle, routingMode, setRoutingMode, singleRenderMode, setSingleRenderMode, showGraphNodes, setShowGraphNodes, deliveryStops, setDeliveryStops, k, setK, showNaiveRoute, setShowNaiveRoute, optimizedRouteData, setOptimizedRouteData, graph, startNodeObj, endNodeObj, setComparisonPaths, animationPhase, phaseData, clusterFrame, clusteringDone, currentZoneIdx, zoneNNDone, zoneSwapIdx, advanceToPhase, substepStatus, runNextSubstep }, ref) => {
     const [sidebar, setSidebar] = useState(false);
     const [snack, setSnack] = useState({
         open: false,
         message: "",
         type: "error",
     });
+    const [clusteringDoneLocal, setClusteringDoneLocal] = useState(false);
+
+    // Comparison States
+    const [showComparisonMenu, setShowComparisonMenu] = useState(false);
+    const [selectedComparisonAlgos, setSelectedComparisonAlgos] = useState(["astar", "dijkstra"]);
+    const [comparisonResults, setComparisonResults] = useState(null);
+    const [isComparing, setIsComparing] = useState(false);
+
+    const handleAlgoToggle = (algo, checked) => {
+        if (checked) {
+            setSelectedComparisonAlgos([...selectedComparisonAlgos, algo]);
+        } else {
+            setSelectedComparisonAlgos(selectedComparisonAlgos.filter(a => a !== algo));
+        }
+    };
+
+    const handleRunComparison = async () => {
+        if (!graph || !startNodeObj || !endNodeObj) return;
+        setIsComparing(true);
+        setComparisonResults(null);
+        setComparisonPaths([]);
+        setTimeout(async () => {
+            const results = await runComparison(selectedComparisonAlgos, graph, startNodeObj, endNodeObj);
+            setComparisonResults(results);
+            setComparisonPaths(results.filter(r => r.path && r.path.length > 0).map(r => ({
+                name: r.name,
+                path: r.path.map(node => [node.longitude ?? node.lon, node.latitude ?? node.lat])
+            })));
+            setIsComparing(false);
+        }, 50);
+    };
+
+    const generateDaaInsights = (results) => {
+        if (!results || results.length < 2) return "Run at least two algorithms to compare.";
+        
+        const insights = [];
+        const astar = results.find(r => r.name === "astar");
+        const dijkstra = results.find(r => r.name === "dijkstra");
+        const greedy = results.find(r => r.name === "greedy");
+        
+        if (astar && dijkstra) {
+            const spaceDiff = dijkstra.nodesExplored - astar.nodesExplored;
+            if (spaceDiff > 0) {
+                insights.push(`Space Complexity: A* pruned the search space using its heuristic, exploring ${spaceDiff} fewer nodes than Dijkstra's exhaustive circle.`);
+            }
+        }
+        
+        if (greedy && (astar || dijkstra)) {
+            const optimal = astar || dijkstra;
+            if (greedy.pathDistanceKm && optimal.pathDistanceKm && greedy.pathDistanceKm > optimal.pathDistanceKm + 0.01) {
+                insights.push(`Optimality vs Speed: Greedy found a sub-optimal path (${greedy.pathDistanceKm.toFixed(2)}km vs ${optimal.pathDistanceKm.toFixed(2)}km) but did it by aggressively following its heuristic.`);
+            } else if (greedy.nodesExplored < optimal.nodesExplored) {
+                insights.push(`Greedy navigated towards the goal very fast (explored only ${greedy.nodesExplored} nodes) and happened to find an optimal path on this specific map topology.`);
+            }
+        }
+
+        const fastest = [...results].sort((a,b) => a.executionTimeMs - b.executionTimeMs)[0];
+        insights.push(`Time Complexity (Real World): ${fastest.displayName} completed fastest in actual execution time (${fastest.executionTimeMs.toFixed(1)}ms).`);
+
+        return insights.map((msg, idx) => <span key={idx} style={{ display: 'block', marginBottom: '8px' }}>{msg}</span>);
+    };
+
     const [showTutorial, setShowTutorial] = useState(false);
     const [activeStep, setActiveStep] = useState(0);
     const [helper, setHelper] = useState(false);
@@ -28,15 +92,66 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
     const [searchResults, setSearchResults] = useState([]);
     const [searchLoading, setSearchLoading] = useState(false);
     const [elbowData, setElbowDataState] = useState([]);
+    const [suggestedK, setSuggestedK] = useState(null);
 
     useEffect(() => {
         if (routingMode === "clustered" && deliveryStops.length >= 2) {
             const data = getElbowData(deliveryStops, Math.min(deliveryStops.length, 8));
             setElbowDataState(data);
+            const optimalK = findElbowK(data);
+            setSuggestedK(optimalK);
         } else {
             setElbowDataState([]);
+            setSuggestedK(null);
         }
     }, [deliveryStops, routingMode]);
+
+    const getNextStepLabel = () => {
+        if (!phaseData) return "";
+        
+        if (animationPhase === 0) {
+            return `Start Intra-Zone Optimization (Zone 1 Nearest Neighbor) ›`;
+        }
+        
+        if (animationPhase === 1) {
+            const zones = phaseData.phases[1].zones;
+            const zone = zones[currentZoneIdx];
+            if (!zone) return "";
+            const zoneStops = zone.nnSegments.length + 1; // approx stops
+
+            if (!zoneNNDone) {
+                if (zone.twoOptSwaps.length > 0) {
+                    return `Refine Zone ${currentZoneIdx + 1} with 2-opt (${zone.twoOptSwaps.length} swap${zone.twoOptSwaps.length > 1 ? 's' : ''} found) ›`;
+                } else {
+                    // 2-opt not possible or no improvement found
+                    const nextZone = currentZoneIdx + 1;
+                    if (nextZone < zones.length) {
+                        return `Zone ${currentZoneIdx + 1}: NN already optimal — Optimize Zone ${nextZone + 1} ›`;
+                    } else {
+                        return `Zone ${currentZoneIdx + 1}: NN already optimal — Connect Zones ›`;
+                    }
+                }
+            } else {
+                const nextSwap = zoneSwapIdx + 1;
+                if (nextSwap < zone.twoOptSwaps.length) {
+                    return `Apply 2-opt Swap ${nextSwap + 1} of ${zone.twoOptSwaps.length} ›`;
+                } else {
+                    const nextZone = currentZoneIdx + 1;
+                    if (nextZone < zones.length) {
+                        return `Zone ${currentZoneIdx + 1} refined — Optimize Zone ${nextZone + 1} ›`;
+                    } else {
+                        return `All zones refined — Connect Zones ›`;
+                    }
+                }
+            }
+        }
+        
+        if (animationPhase === 2) {
+            return "View Full Route Summary ›";
+        }
+        
+        return "";
+    };
 
     const handleSearch = async () => {
         if (!searchQuery) return;
@@ -271,6 +386,85 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
                 </Button>
             </div>
 
+            {/* Comparison Menu Toggle */}
+            {routingMode === "single" && (
+                <div className="comparison-toggle" onClick={() => setShowComparisonMenu(true)}>
+                    <MdBarChart />
+
+                    <span>Compare</span>
+                </div>
+            )}
+
+            {/* Comparison Modal / Panel */}
+            {showComparisonMenu && (
+                <div className="comparison-panel">
+                    <div className="panel-header">
+                        <h3>Algorithm Comparison</h3>
+                        <i className="material-icons" style={{cursor: "pointer"}} onClick={() => setShowComparisonMenu(false)}>close</i>
+                    </div>
+                    
+                    <div className="panel-body">
+                        <div className="algo-selection">
+                            <label><input type="checkbox" checked={selectedComparisonAlgos.includes("astar")} onChange={(e) => handleAlgoToggle("astar", e.target.checked)} /> A* Search</label>
+                            <label><input type="checkbox" checked={selectedComparisonAlgos.includes("dijkstra")} onChange={(e) => handleAlgoToggle("dijkstra", e.target.checked)} /> Dijkstra</label>
+                            <label><input type="checkbox" checked={selectedComparisonAlgos.includes("greedy")} onChange={(e) => handleAlgoToggle("greedy", e.target.checked)} /> Greedy Best-First</label>
+                            <label><input type="checkbox" checked={selectedComparisonAlgos.includes("bidirectional")} onChange={(e) => handleAlgoToggle("bidirectional", e.target.checked)} /> Bidirectional</label>
+                        </div>
+                        
+                        <button 
+                            className="run-comparison-btn" 
+                            disabled={!canStart || selectedComparisonAlgos.length < 2 || isComparing}
+                            onClick={handleRunComparison}
+                        >
+                            {isComparing ? "Running Analysis..." : "Run Analysis"}
+                        </button>
+
+                        {comparisonResults && (
+                            <div className="comparison-results">
+                                <table className="comparison-table">
+                                    <thead>
+                                        <tr>
+                                            <th style={{ textAlign: "left" }}>Algorithm</th>
+                                            <th>Time (ms)</th>
+                                            <th>Nodes Explored</th>
+                                            <th>Distance (km)</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {comparisonResults.map(res => {
+                                            const COMPARISON_COLORS = {
+                                                "astar": "#FF3C3C",
+                                                "dijkstra": "#3C96FF",
+                                                "greedy": "#3CFF64",
+                                                "bidirectional": "#C83CFF"
+                                            };
+                                            return (
+                                                <tr key={res.name} className={!res.pathFound ? "failed-path" : ""}>
+                                                    <td style={{ textAlign: "left", display: "flex", alignItems: "center", gap: "8px" }}>
+                                                        <div style={{ width: "12px", height: "12px", borderRadius: "50%", background: COMPARISON_COLORS[res.name] || "#FFF" }} />
+                                                        {res.displayName}
+                                                    </td>
+                                                    <td>{res.executionTimeMs.toFixed(2)}</td>
+                                                    <td>{res.nodesExplored}</td>
+                                                    <td>{res.pathDistanceKm ? res.pathDistanceKm.toFixed(2) : 'N/A'}</td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+
+                                <div className="daa-insights">
+                                    <h4><i className="material-icons">lightbulb</i> DAA Insights</h4>
+                                    <div className="insights-content">
+                                        {generateDaaInsights(comparisonResults)}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
+
             <Backdrop
                 open={showTutorial}
                 onClick={e => {if(e.target.classList.contains("backdrop")) setShowTutorial(false);}}
@@ -367,6 +561,16 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
                             <MenuItem value={"bidirectional"}>Bidirectional Search algorithm</MenuItem>
                         </Select>
                     </FormControl>
+
+                    {routingMode === "clustered" && (
+                        <div style={{ padding: "8px", backgroundColor: "rgba(0,0,0,0.2)", borderRadius: "4px", fontSize: "12px", color: "#ccc", marginTop: "-10px", marginBottom: "10px" }}>
+                            <strong style={{ color: "#fff" }}>Clustered Algorithms in use:</strong><br/>
+                            • <em>Clustering:</em> K-Means++<br/>
+                            • <em>Sequencing:</em> Nearest Neighbor<br/>
+                            • <em>Optimization:</em> 2-Opt<br/>
+                            • <em>Pathfinding:</em> {settings.algorithm === 'astar' ? 'A*' : settings.algorithm === 'dijkstra' ? "Dijkstra's" : settings.algorithm === 'greedy' ? 'Greedy' : 'Bidirectional'}
+                        </div>
+                    )}
 
                     <FormControl variant="filled">
                         <InputLabel style={{ fontSize: 14 }} id="map-style-select">Map Style</InputLabel>
@@ -575,7 +779,53 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
                         Clustered Delivery
                     </button>
                 </div>
+                {routingMode === "single" && (
+                    <div className="mode-toggle-card" style={{ marginTop: 8 }}>
+                        <button 
+                            onClick={() => { setSingleRenderMode("lines"); }}
+                            className={singleRenderMode === "lines" ? "mode-btn active" : "mode-btn"}
+                        >
+                            Lines
+                        </button>
+                        <button 
+                            onClick={() => { setSingleRenderMode("points"); }}
+                            className={singleRenderMode === "points" ? "mode-btn active" : "mode-btn"}
+                        >
+                            Points
+                        </button>
+                    </div>
+                )}
+                <div className="mode-toggle-card" style={{ marginTop: 8 }}>
+                    <button 
+                        onClick={() => { setShowGraphNodes(!showGraphNodes); }}
+                        className={showGraphNodes ? "mode-btn active" : "mode-btn"}
+                    >
+                        {showGraphNodes ? "Hide Graph Nodes" : "Show Graph Nodes"}
+                    </button>
+                </div>
             </div>
+
+            {/* Phase indicator — shown when CTSP animation is running */}
+            {routingMode === "clustered" && phaseData && !cinematic && (
+                <div className="phase-indicator-bar">
+                    {[
+                        { label: "K-Means", icon: "⬡" },
+                        { label: "Intra-zone TSP", icon: "↻" },
+                        { label: "Zone linking", icon: "→" },
+                        { label: "Summary", icon: "✓" }
+                    ].map((p, idx) => (
+                        <div
+                            key={idx}
+                            className={`phase-step ${animationPhase === idx ? "active" : ""} ${animationPhase > idx ? "done" : ""}`}
+                            onClick={() => animationPhase > idx && advanceToPhase(idx)}
+                        >
+                            <span className="phase-icon">{p.icon}</span>
+                            <span className="phase-label">{p.label}</span>
+                            {idx < 3 && <span className="phase-arrow">›</span>}
+                        </div>
+                    ))}
+                </div>
+            )}
 
             {/* Clustered Panel */}
             {routingMode === "clustered" && !cinematic && (
@@ -583,6 +833,116 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
                     <Typography variant="h6" className="panel-title">
                         Clustered Delivery Routing (CTSP)
                     </Typography>
+
+                    {/* Phase explanation card — shown during animation */}
+                    {phaseData && (() => {
+                        const explanations = [
+                            {
+                                title: "K-Means Clustering",
+                                algo: "K-Means++ initialization → iterative reassignment",
+                                complexity: "O(n · k · iterations)",
+                                description: clusteringDone
+                                    ? `Converged in ${phaseData.phases[0].frames.length - 1} iterations. ${deliveryStops.length} stops split into ${phaseData.phases[0].k} zones.`
+                                    : `Iteration ${clusterFrame} of ${phaseData.phases[0].frames.length - 1}. Watch centroids (white rings) pull stops into zones.`,
+                                color: "#9b87f5"
+                            },
+                            {
+                                title: "Intra-zone TSP",
+                                algo: "Nearest Neighbor greedy → 2-opt refinement",
+                                complexity: "O(n²) NN + O(n²) 2-opt per zone",
+                                description: (() => {
+                                    const zones = phaseData.phases[1].zones;
+                                    const zone = zones[currentZoneIdx];
+                                    if (!zone) return "";
+                                    const swaps = zone.twoOptSwaps.length;
+                                    const numStops = zone.stopCount ?? (zone.nnSegments.length + 1);
+
+                                    if (zoneNNDone) {
+                                        return `Zone ${currentZoneIdx + 1} — 2-opt swap ${zoneSwapIdx + 1}/${swaps}: reversing a sub-tour segment to eliminate crossings and reduce total distance.`;
+                                    }
+
+                                    // NN just finished — explain 2-opt availability
+                                    if (swaps === 0) {
+                                        if (numStops <= 2) {
+                                            return `Zone ${currentZoneIdx + 1} has only ${numStops} stop${numStops > 1 ? 's' : ''} — 2-opt requires at least 3 stops to attempt any swap. The Nearest Neighbor tour is already the only possible ordering.`;
+                                        }
+                                        return `Zone ${currentZoneIdx + 1} — Nearest Neighbor already found the optimal tour! No 2-opt improvements were possible (0 crossings to resolve).`;
+                                    }
+                                    return `Zone ${currentZoneIdx + 1} — NN path drawn. Found ${swaps} 2-opt improvement${swaps > 1 ? 's' : ''} to apply. Click to start refining.`;
+                                })(),
+                                color: "#1D9E75"
+                            },
+                            {
+                                title: "Zone sequencing",
+                                algo: "Nearest neighbor on zone centroids",
+                                complexity: "O(k²) — negligible for small k",
+                                description: `Connecting depot → zones → depot via shortest connector paths. Gray lines are inter-zone transitions.`,
+                                color: "#EF9F27"
+                            },
+                            {
+                                title: "Solution found",
+                                algo: "CTSP: K-Means + per-cluster 2-opt",
+                                complexity: "Total: O(n·k·i) + O(n²·k)",
+                                description: optimizedRouteData
+                                    ? `Saved ${optimizedRouteData.stats.distanceSaved.toFixed(2)} km vs naive (${optimizedRouteData.stats.percentageReduction.toFixed(1)}% reduction).`
+                                    : "",
+                                color: "#D85A30"
+                            }
+                        ][animationPhase];
+
+                        return (
+                            <div className="phase-explanation-card" style={{ borderLeftColor: explanations.color }}>
+                                <div className="phase-card-title" style={{ color: explanations.color }}>{explanations.title}</div>
+                                <div className="phase-card-algo">{explanations.algo}</div>
+                                <div className="phase-card-complexity">complexity: {explanations.complexity}</div>
+                                <div className="phase-card-desc">{explanations.description}</div>
+                            </div>
+                        );
+                    })()}
+
+                    {/* Next step button */}
+                    {phaseData && animationPhase < 3 && substepStatus === "completed" && (
+                        <div className="next-step-section" style={{ marginBottom: 12 }}>
+                            <button
+                                className="next-step-btn primary-glow"
+                                onClick={runNextSubstep}
+                                style={{
+                                    width: "100%",
+                                    padding: "10px",
+                                    borderRadius: "8px",
+                                    border: "none",
+                                    background: "#46B780",
+                                    color: "#fff",
+                                    fontWeight: "bold",
+                                    fontSize: "12px",
+                                    cursor: "pointer",
+                                    boxShadow: "0 0 12px rgba(70, 183, 128, 0.4)",
+                                    transition: "all 0.2s"
+                                }}
+                            >
+                                {getNextStepLabel()}
+                            </button>
+                        </div>
+                    )}
+
+                    {/* Manual next/prev phase controls */}
+                    {phaseData && animationPhase < 3 && (
+                        <div className="phase-controls">
+                            <button
+                                className="phase-ctrl-btn"
+                                onClick={() => advanceToPhase(Math.max(0, animationPhase - 1))}
+                                disabled={animationPhase === 0}
+                            >
+                                ‹ Prev phase
+                            </button>
+                            <button
+                                className="phase-ctrl-btn primary"
+                                onClick={() => advanceToPhase(animationPhase + 1)}
+                            >
+                                Skip to next ›
+                            </button>
+                        </div>
+                    )}
                     
                     {/* Search Stop */}
                     <div className="search-section">
@@ -654,7 +1014,7 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
                                 value={k} 
                                 onChange={e => {
                                     setK(Number(e.target.value));
-                                    setOptimizedRouteData(null);
+                                    clearPath();
                                 }}
                                 className="slider"
                             />
@@ -697,8 +1057,34 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
                                                     </g>
                                                 );
                                             })}
+                                            {/* Highlight optimal/elbow k */}
+                                            {elbowData.map((d, idx) => {
+                                                const x = 20 + (idx * (160 / (elbowData.length - 1)));
+                                                const maxWcss = Math.max(...elbowData.map(ed => ed.wcss));
+                                                const minWcss = Math.min(...elbowData.map(ed => ed.wcss));
+                                                const y = 65 - ((d.wcss - minWcss) / (maxWcss - minWcss || 1)) * 50;
+                                                if (d.k !== suggestedK) return null;
+                                                return (
+                                                    <g key={`elbow-${d.k}`}>
+                                                        <circle cx={x} cy={y} r={6} fill="none" stroke="#FF6B35" strokeWidth="2" />
+                                                        <text x={x} y={y - 8} fontSize="7" fill="#FF6B35" textAnchor="middle" fontWeight="bold">
+                                                            optimal
+                                                        </text>
+                                                    </g>
+                                                );
+                                            })}
                                         </svg>
                                     </div>
+                                    {suggestedK && (
+                                        <div className="k-suggestion">
+                                            📐 Elbow method suggests <strong>k = {suggestedK}</strong>
+                                            {suggestedK !== k && (
+                                                <button className="apply-k-btn" onClick={() => setK(suggestedK)}>
+                                                    Apply
+                                                </button>
+                                            )}
+                                        </div>
+                                    )}
                                 </div>
                             )}
                         </div>
@@ -707,7 +1093,12 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
                     {/* Stats Dashboard */}
                     {optimizedRouteData && (
                         <div className="stats-section">
-                            <Typography variant="caption" className="section-label">ROUTING METRICS</Typography>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+                                <Typography variant="caption" className="section-label" style={{ marginBottom: 0 }}>ROUTING METRICS</Typography>
+                                <Typography variant="caption" style={{ color: "#46B780", fontWeight: "bold", letterSpacing: "1px" }}>
+                                    {settings.algorithm === 'astar' ? 'A* SEARCH' : settings.algorithm === 'dijkstra' ? "DIJKSTRA'S" : settings.algorithm === 'greedy' ? 'GREEDY' : 'BIDIRECTIONAL'}
+                                </Typography>
+                            </div>
                             
                             <div className="comparison-container">
                                 <div className="route-stat naive">
@@ -740,13 +1131,13 @@ const Interface = forwardRef(({ canStart, started, animationEnded, playbackOn, t
                                     id="show-naive-checkbox"
                                     checked={showNaiveRoute}
                                     onChange={e => setShowNaiveRoute(e.target.checked)}
-                                />
-                                <label htmlFor="show-naive-checkbox">Show Naive Route (Overlay)</label>
-                            </div>
-                        </div>
-                    )}
-                </div>
-            )}
+                                  />
+                                  <label htmlFor="show-naive-checkbox">Show Naive Route (Overlay)</label>
+                              </div>
+                          </div>
+                      )}
+                  </div>
+              )}
         </>
     );
 });
